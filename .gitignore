@@ -1,0 +1,37 @@
+# ── Python byte-code / caches ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+
+# ── Virtual environments ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Packaging / build artifacts ────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ── Tool / script output ───────────────────────────────────────────────────
+# JSON reports produced via `--json > duplicates.json`
+duplicates.json
+*.dedupe.json
+
+# ── Editor / IDE ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── OS cruft ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
