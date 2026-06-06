@@ -19,6 +19,10 @@ Comparing by name or size alone is unreliable — different files can share a si
 - **Symlink / special-file safe** — symlinks, FIFOs, sockets, and device files are skipped; TOCTOU windows around hashing are guarded with `O_NOFOLLOW` (POSIX) and re-checks (Windows).
 - **Sensible directory pruning** — skips common noise directories like `.git`, `node_modules`, `__pycache__`, `venv`, `dist`, `.idea`, `.vscode`, and more.
 - **Minimum-size filter** — `--min-size` ignores small files so trivial matches don't clutter results.
+- **Colorized, readable output** — semantic color highlights wasted space (yellow) and destructive actions (red); auto-disables when output isn't a terminal, when `NO_COLOR` is set, or with `--color never`.
+- **Quiet / verbose modes** — `--quiet` silences the banner and progress; `--verbose` adds elapsed time and hashing throughput.
+- **Live progress** — hashing progress is reported by bytes processed (not just file count), so scans of a few very large files still show movement.
+- **Script-friendly exit codes** — `0` (no duplicates), `2` (duplicates found), `1` (error), so CI and shell scripts can branch on the result.
 - **Hostile-filename safe output** — non-printable characters (newlines, ANSI escapes) in filenames are escaped so a crafted filename can't rewrite your terminal or spoof the deletion plan.
 - **Cross-platform** — works on Windows, macOS, and Linux; reconfigures stdout to UTF-8 on Windows so Unicode paths print correctly.
 
@@ -56,15 +60,39 @@ python file-deduper.py ~/Documents --json
 
 # Save JSON to a file while progress prints to the terminal
 python file-deduper.py ~/Documents --json > duplicates.json
+
+# Silence the banner/progress, or disable color for logging
+python file-deduper.py ~/Downloads --quiet --color never
+
+# Show elapsed time and hashing throughput
+python file-deduper.py ~/Pictures --verbose
 ```
 
-| Argument            | Description                                                        |
-| ------------------- | ------------------------------------------------------------------ |
-| `directory`         | Directory to scan recursively (required).                          |
-| `--json`            | Emit results as JSON on stdout; progress messages go to stderr.    |
-| `--min-size KB`     | Skip files smaller than this many KB (default: 1).                 |
+| Argument            | Description                                                              |
+| ------------------- | ------------------------------------------------------------------------ |
+| `directory`         | Directory to scan recursively (required).                                |
+| `--json`            | Emit results as JSON on stdout; progress messages go to stderr.          |
+| `--min-size KB`     | Skip files smaller than this many KB (default: 1).                       |
+| `--color {auto,always,never}` | When to colorize output (default: `auto`). Also honors `NO_COLOR`. |
+| `-q`, `--quiet`     | Suppress the banner and progress output on stderr.                       |
+| `-v`, `--verbose`   | Print extra detail (elapsed time and hashing throughput).               |
 
 After a text-mode report, if you are running in an interactive terminal you'll be offered an optional cleanup step. (When stdout is piped or `--json` is used, no prompt appears.)
+
+### Exit codes
+
+| Code | Meaning                                  |
+| ---- | ---------------------------------------- |
+| `0`  | Ran successfully; no duplicates found.    |
+| `2`  | Ran successfully; duplicate groups found. |
+| `1`  | Error (e.g. the directory does not exist).|
+
+This makes the tool easy to use in scripts — for example, fail a CI job when duplicates appear:
+
+```bash
+python file-deduper.py ./assets --json > dupes.json || \
+  { [ $? -eq 2 ] && echo "Duplicates detected!" && exit 1; }
+```
 
 ## Example output
 
@@ -141,13 +169,23 @@ JSON report (`--json`):
 
 ## Roadmap
 
-These are planned but not yet implemented (placeholders exist in the argument parser):
+Engine and correctness work that is planned but not yet implemented:
+
+- Optional parallel hashing for large trees.
+- Optional byte-by-byte verification of hash matches.
+
+## UX roadmap
+
+User-experience improvements that make the tool friendlier and more flexible (some have placeholders in the argument parser):
 
 - `--move DEST` — move duplicate copies into a destination folder instead of deleting them.
 - `--ignore PATTERN` — skip paths matching an `fnmatch` glob pattern.
-- Configurable "keep" strategy (e.g. keep newest, or keep the shortest path).
-- Optional parallel hashing for large trees.
-- Optional byte-by-byte verification of hash matches.
+- Configurable "keep" strategy via `--keep {oldest,newest,shortest-path}` (currently always keeps the oldest).
+- Per-group "keep" selection in the interactive prompt (choose which copy survives, not just exclude whole groups).
+- `--dry-run` — print the deletion plan without a terminal prompt, for previewing in scripts.
+- `--csv` output alongside `--json`, for spreadsheet users.
+- `--follow-symlinks` — opt in to following symlinks (off by default).
+- `--save-report FILE` — write the text report to a file.
 
 ## License
 

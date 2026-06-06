@@ -9,6 +9,11 @@ Usage:
 Options:
     --json              Output results as JSON (progress goes to stderr)
     --min-size KB       Minimum file size in KB to consider (default: 1)
+    --color WHEN        Colorize output: auto (default) | always | never
+    -q, --quiet         Suppress the banner and progress output
+    -v, --verbose       Print elapsed time and hashing throughput
+
+Exit codes: 0 = no duplicates, 2 = duplicates found, 1 = error.
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ import json
 import os
 import stat as _stat
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +41,93 @@ SKIP_DIRS: frozenset[str] = frozenset({
 
 DEFAULT_MIN_SIZE_KB = 1
 _HASH_CHUNK = 65_536  # 64 KB read buffer
+
+# Exit codes (documented in README): script-friendly so CI can branch on them.
+EXIT_OK = 0          # ran cleanly, no duplicates found
+EXIT_ERROR = 1       # usage error / bad path
+EXIT_DUPLICATES = 2  # ran cleanly, duplicates were found
+
+
+# ── Color / output styling ─────────────────────────────────────────────────────
+
+class Style:
+    """ANSI color wrapper that no-ops when color is disabled.
+
+    Color is *semantic*, not decorative: yellow marks wasted space (the number
+    users act on), red marks destructive/error output, green marks all-clear.
+    A disabled Style returns text unchanged, so call sites never branch.
+    """
+    _CODES = {
+        "cyan": "36", "dim": "2", "yellow": "33", "bold_yellow": "1;33",
+        "red": "31", "bold_red": "1;31", "green": "32", "bold": "1",
+    }
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if self.enabled else s
+
+    def __getattr__(self, name: str):
+        # style.yellow("...") etc. — resolved lazily from _CODES.
+        if name in Style._CODES:
+            return lambda s: self._wrap(Style._CODES[name], s)
+        raise AttributeError(name)
+
+
+def _enable_windows_vt() -> bool:
+    """Enable ANSI escape processing on legacy Windows consoles.
+
+    Modern Windows Terminal / PowerShell 7 already handle ANSI, but legacy
+    conhost needs ENABLE_VIRTUAL_TERMINAL_PROCESSING set explicitly. Returns
+    True if the console accepts ANSI (or we're not on Windows), False if we
+    couldn't enable it and color should be suppressed.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        ENABLE_VT = 0x0004
+        return bool(kernel32.SetConsoleMode(handle, mode.value | ENABLE_VT))
+    except Exception:
+        return False
+
+
+def make_style(mode: str, stream) -> Style:
+    """Decide whether to colorize, honoring --color, NO_COLOR, and TTY state.
+
+    mode is 'auto' (color only at a TTY), 'always', or 'never'. The NO_COLOR
+    convention (https://no-color.org) wins over 'auto' but not over 'always'.
+    """
+    if mode == "never":
+        return Style(False)
+    if mode == "auto":
+        if os.environ.get("NO_COLOR") is not None:
+            return Style(False)
+        if not (hasattr(stream, "isatty") and stream.isatty()):
+            return Style(False)
+    return Style(_enable_windows_vt())
+
+
+BANNER = r"""
+  __ _ _        _        _
+ / _(_) |___ __| |___ __| |_  _ _ __  ___ _ _
+|  _| | / -_) _` / -_) _` | || | '_ \/ -_) '_|
+|_| |_|_\___\__,_\___\__,_|\_,_| .__/\___|_|
+   find duplicate files by SHA-256  |  read-only
+"""
+
+
+def print_banner(style: Style, stream) -> None:
+    """Print the ASCII-art banner to the given stream (text mode, non-quiet)."""
+    print(style.cyan(BANNER.rstrip("\n")), file=stream)
+    print(file=stream)
 
 
 # ── Core logic ───────────────────────────────────────────────────────────────
@@ -101,13 +194,19 @@ def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tup
     return found
 
 
-def find_duplicates(files: list[tuple[int, Path]]) -> dict[str, tuple[int, list[Path]]]:
+def find_duplicates(
+    files: list[tuple[int, Path]],
+    style: Style | None = None,
+    quiet: bool = False,
+) -> dict[str, tuple[int, list[Path]]]:
     """Return hash → (size_bytes, [paths]) for every SHA-256 that appears >1 time.
 
     Two-pass: group by size first (free), then hash only size-collision sets.
     This avoids reading files whose size is unique — often 60-80% of a tree.
     Sizes come from walk_files so no stat calls are needed here.
     """
+    style = style or Style(False)
+
     # Pass 1 — group by size (sizes already known, no stat needed)
     by_size: dict[int, list[Path]] = defaultdict(list)
     for size, p in files:
@@ -115,19 +214,31 @@ def find_duplicates(files: list[tuple[int, Path]]) -> dict[str, tuple[int, list[
 
     candidates = [(size, p) for size, ps in by_size.items() if len(ps) > 1 for p in ps]
 
-    # Pass 2 — hash candidates
+    # Pass 2 — hash candidates. Progress is byte-based, not file-count based:
+    # a tree of a few huge files would otherwise show nothing for a long time.
     by_hash: dict[str, list[Path]] = defaultdict(list)
     hash_sizes: dict[str, int] = {}
     total = len(candidates)
+    total_bytes = sum(size for size, _ in candidates)
+    done_bytes = 0
+    last_tick = 0.0
     for i, (size, p) in enumerate(candidates, 1):
-        if i % 500 == 0 or i == total:
-            print(f"  hashing {i}/{total}...", file=sys.stderr)
         try:
             h = hash_file(p)
             by_hash[h].append(p)
             hash_sizes.setdefault(h, size)
         except OSError:
             pass
+        done_bytes += size
+        now = time.monotonic()
+        # Refresh at most ~5×/sec to avoid flooding stderr, plus a final line.
+        if not quiet and (now - last_tick > 0.2 or i == total):
+            last_tick = now
+            pct = (done_bytes / total_bytes * 100) if total_bytes else 100
+            line = (f"  hashing {i}/{total} files  "
+                    f"({fmt_size(done_bytes)}/{fmt_size(total_bytes)}, {pct:.0f}%)")
+            end = "\n" if i == total else "\r"
+            print(style.dim(line.ljust(60)), end=end, file=sys.stderr, flush=True)
 
     return {h: (hash_sizes[h], ps) for h, ps in by_hash.items() if len(ps) > 1}
 
@@ -158,10 +269,15 @@ def _display(path: object) -> str:
 
 # ── Reporters ─────────────────────────────────────────────────────────────────
 
-def report_text(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> None:
+def report_text(
+    root: Path,
+    duplicates: dict[str, tuple[int, list[Path]]],
+    style: Style | None = None,
+) -> None:
+    style = style or Style(False)
     print(f"Scanned: {root}")
     if not duplicates:
-        print("No duplicates found.")
+        print(style.green("No duplicates found."))
         return
 
     total_wasted = 0
@@ -175,17 +291,20 @@ def report_text(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
         wasted = size * (len(paths) - 1)
         total_wasted += wasted
         print(
-            f"\nGroup {i}: {len(paths)} copies  "
+            f"\n{style.bold(f'Group {i}')}: {len(paths)} copies  "
             f"{fmt_size(size)} each  "
-            f"{fmt_size(wasted)} wasted"
+            f"{style.yellow(f'{fmt_size(wasted)} wasted')}"
         )
-        print(f"  hash: {h[:16]}...")
+        print(style.dim(f"  hash: {h[:16]}..."))
         for p in sorted(paths):
             print(f"  {_display(p)}")
 
     bar = "-" * 60
     print(f"\n{bar}")
-    print(f"{len(duplicates)} group(s)  |  {fmt_size(total_wasted)} wasted in total")
+    print(
+        f"{len(duplicates)} group(s)  |  "
+        f"{style.bold_yellow(f'{fmt_size(total_wasted)} wasted in total')}"
+    )
 
 
 def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> None:
@@ -212,7 +331,10 @@ def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
 
 # ── Interactive cleanup ───────────────────────────────────────────────────────
 
-def interactive_delete(duplicates: dict[str, tuple[int, list[Path]]]) -> None:
+def interactive_delete(
+    duplicates: dict[str, tuple[int, list[Path]]],
+    style: Style | None = None,
+) -> None:
     """Prompt the user to delete redundant copies from each duplicate group.
 
     The oldest file in each group is kept as the canonical original; every other
@@ -221,6 +343,7 @@ def interactive_delete(duplicates: dict[str, tuple[int, list[Path]]]) -> None:
     Never runs automatically: requires two explicit confirmations from the user.
     Silently skips if stdin is not a terminal (piped/scripted usage).
     """
+    style = style or Style(False)
     if not sys.stdin.isatty():
         return
 
@@ -287,15 +410,16 @@ def interactive_delete(duplicates: dict[str, tuple[int, list[Path]]]) -> None:
         return
 
     total_freed = sum(size for _, _, size, _, _ in plan)
-    print(f"\nDeletion plan -- {len(plan)} file(s), freeing {fmt_size(total_freed)}:")
+    print(f"\nDeletion plan -- {len(plan)} file(s), "
+          f"freeing {style.bold_yellow(fmt_size(total_freed))}:")
     for group_num, path, size, mtime, _ in plan:
         ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
         print(f"  [group {group_num}]  {_display(path)}")
-        print(f"             size: {fmt_size(size)}  |  last modified: {ts}")
+        print(style.dim(f"             size: {fmt_size(size)}  |  last modified: {ts}"))
 
     try:
         confirm = input(
-            "\nProceed with deletion? This cannot be undone. [y/N]: "
+            style.bold_red("\nProceed with deletion? This cannot be undone.") + " [y/N]: "
         ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("\nAborted.")
@@ -313,19 +437,20 @@ def interactive_delete(duplicates: dict[str, tuple[int, list[Path]]]) -> None:
             # scan and now is no longer a confirmed duplicate, so never delete it.
             try:
                 if hash_file(path) != group_hash:
-                    print(f"  skipped (changed since scan): {_display(path)}", file=sys.stderr)
+                    print(style.yellow(f"  skipped (changed since scan): {_display(path)}"),
+                          file=sys.stderr)
                     skipped += 1
                     continue
             except OSError as e:
-                print(f"  error: {_display(path)}: {e}", file=sys.stderr)
+                print(style.bold_red(f"  error: {_display(path)}: {e}"), file=sys.stderr)
                 errors += 1
                 continue
             try:
                 path.unlink()
-                print(f"  deleted: {_display(path)}")
+                print(style.red(f"  deleted: {_display(path)}"))
                 deleted += 1
             except OSError as e:
-                print(f"  error: {_display(path)}: {e}", file=sys.stderr)
+                print(style.bold_red(f"  error: {_display(path)}: {e}"), file=sys.stderr)
                 errors += 1
     except KeyboardInterrupt:
         print("\nInterrupted -- stopping deletion.", file=sys.stderr)
@@ -365,6 +490,24 @@ examples:
         metavar="KB",
         help=f"Skip files smaller than this many KB (default: {DEFAULT_MIN_SIZE_KB})",
     )
+    p.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="When to colorize output (default: auto — color only at a TTY; "
+             "also honors the NO_COLOR env var)",
+    )
+    verbosity = p.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Suppress the banner and progress output on stderr",
+    )
+    verbosity.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print extra detail (elapsed time and hashing throughput)",
+    )
     # Roadmap placeholders — not wired up yet, but accepted so callers don't break
     # when we add them in a future version.
     # p.add_argument("--move", metavar="DEST", help="[roadmap] Move dupes to DEST folder")
@@ -373,10 +516,12 @@ examples:
     return p
 
 
-def main() -> None:
-    # Ensure stdout can emit Unicode file paths on Windows (default is cp1252).
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def main() -> int:
+    # Ensure both streams can emit Unicode file paths on Windows (default is
+    # cp1252): stdout carries the report, stderr the banner/progress/paths.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
 
     parser = build_parser()
     args = parser.parse_args()
@@ -384,40 +529,62 @@ def main() -> None:
     if args.min_size < 1:
         parser.error("--min-size must be at least 1")
 
+    # Color follows whichever stream carries the report: stdout for JSON, but
+    # the human-facing report and banner are judged against stderr's TTY state.
+    style = make_style(args.color, sys.stdout if args.json else sys.stderr)
+
+    if not args.json and not args.quiet:
+        print_banner(style, sys.stderr)
+
     root = Path(args.directory).expanduser().resolve()
     if not root.exists():
-        print(f"error: directory not found: {root}", file=sys.stderr)
-        sys.exit(1)
+        print(style.bold_red(f"error: directory not found: {root}"), file=sys.stderr)
+        return EXIT_ERROR
     if not root.is_dir():
-        print(f"error: not a directory: {root}", file=sys.stderr)
-        sys.exit(1)
+        print(style.bold_red(f"error: not a directory: {root}"), file=sys.stderr)
+        return EXIT_ERROR
 
     min_bytes = args.min_size * 1024
+    started = time.monotonic()
 
     # Progress always goes to stderr so --json stdout stays clean.
-    print(f"Scanning {root}", file=sys.stderr)
-    print(f"Min size: {fmt_size(min_bytes)}  |  skip dirs: {len(SKIP_DIRS)}", file=sys.stderr)
+    if not args.quiet:
+        print(style.dim(f"Scanning {root}"), file=sys.stderr)
+        print(style.dim(f"Min size: {fmt_size(min_bytes)}  |  "
+                        f"skip dirs: {len(SKIP_DIRS)}"), file=sys.stderr)
 
     files = walk_files(root, min_bytes, SKIP_DIRS)
-    print(f"Files eligible: {len(files)}", file=sys.stderr)
+    if not args.quiet:
+        print(style.dim(f"Files eligible: {len(files)}"), file=sys.stderr)
 
     if not files:
         if args.json:
             print(json.dumps({"scanned_root": str(root), "duplicate_groups": 0,
                                "total_wasted_bytes": 0, "groups": []}, ensure_ascii=False))
         else:
-            print("No eligible files found.")
-        return
+            print(style.green("No eligible files found."))
+        return EXIT_OK
 
-    duplicates = find_duplicates(files)
-    print(f"Done - {len(duplicates)} duplicate group(s) found.", file=sys.stderr)
+    duplicates = find_duplicates(files, style=style, quiet=args.quiet)
+
+    if not args.quiet:
+        elapsed = time.monotonic() - started
+        msg = f"Done - {len(duplicates)} duplicate group(s) found."
+        if args.verbose:
+            scanned = sum(size for size, _ in files)
+            rate = scanned / elapsed if elapsed else 0
+            msg += (f"  [{elapsed:.1f}s, {len(files)} files, "
+                    f"{fmt_size(scanned)} eligible, {fmt_size(rate)}/s]")
+        print(style.dim(msg), file=sys.stderr)
 
     if args.json:
         report_json(root, duplicates)
     else:
-        report_text(root, duplicates)
-        interactive_delete(duplicates)
+        report_text(root, duplicates, style=style)
+        interactive_delete(duplicates, style=style)
+
+    return EXIT_DUPLICATES if duplicates else EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
