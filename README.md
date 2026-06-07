@@ -37,7 +37,7 @@ No package install is required. Just download the script.
 
 ```bash
 # Clone or copy the repository
-git clone <your-repo-url>
+git clone https://github.com/RyanSecEng/file-deduper.git
 cd file-deduper
 
 # (Optional) make it executable on macOS/Linux
