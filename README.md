@@ -23,7 +23,7 @@ Comparing by name or size alone is unreliable — different files can share a si
 - **Quiet / verbose modes** — `--quiet` silences the banner and progress; `--verbose` adds elapsed time and hashing throughput.
 - **Live progress** — hashing progress is reported by bytes processed (not just file count), so scans of a few very large files still show movement.
 - **Script-friendly exit codes** — `0` (no duplicates), `2` (duplicates found), `1` (error), so CI and shell scripts can branch on the result.
-- **Hostile-filename safe output** — non-printable characters (newlines, ANSI escapes) in filenames are escaped so a crafted filename can't rewrite your terminal or spoof the deletion plan.
+- **Hostile-filename safe output** — non-printable characters (newlines, ANSI escapes) are escaped on *every* path that reaches the terminal — the duplicate listing, the deletion plan, the scanned-root header, and even OS error messages (which embed the offending filename) — so a crafted filename can't rewrite your terminal or spoof the deletion plan.
 - **Cross-platform** — works on Windows, macOS, and Linux; reconfigures stdout to UTF-8 on Windows so Unicode paths print correctly.
 
 ## Requirements

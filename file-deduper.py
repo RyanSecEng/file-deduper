@@ -147,7 +147,7 @@ def hash_file(path: Path) -> str:
         # file. This shrinks (though cannot fully eliminate) the race window.
         if getattr(os, "O_NOFOLLOW", 0) == 0:
             if _stat.S_ISLNK(os.lstat(path).st_mode) or not _stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(f"refusing to hash non-regular or symlinked file: {path}")
+                raise OSError(f"refusing to hash non-regular or symlinked file: {_display(path)}")
     except Exception:
         os.close(fd)
         raise
@@ -267,6 +267,18 @@ def _display(path: object) -> str:
     )
 
 
+def _display_err(e: object) -> str:
+    """Render an exception safely for terminal output.
+
+    OSError stringifies with the offending filename appended (e.g.
+    "[Errno 2] No such file or directory: '/path/with/\\x1b[2J'"), so a hostile
+    filename can smuggle escape sequences in through the *error* path even when
+    the path itself was sanitized separately. Route every exception through the
+    same neutralizer as paths.
+    """
+    return _display(str(e))
+
+
 # ── Reporters ─────────────────────────────────────────────────────────────────
 
 def report_text(
@@ -275,7 +287,7 @@ def report_text(
     style: Style | None = None,
 ) -> None:
     style = style or Style(False)
-    print(f"Scanned: {root}")
+    print(f"Scanned: {_display(root)}")
     if not duplicates:
         print(style.green("No duplicates found."))
         return
@@ -380,7 +392,7 @@ def interactive_delete(
             else:
                 print(f"  warning: group {n} is out of range, ignoring.", file=sys.stderr)
         except ValueError:
-            print(f"  warning: '{tok}' is not a number, ignoring.", file=sys.stderr)
+            print(f"  warning: '{_display(tok)}' is not a number, ignoring.", file=sys.stderr)
 
     # Build deletion plan: keep the oldest file in each group, delete the rest.
     # Each entry carries the group hash so it can be re-verified before unlink.
@@ -395,7 +407,7 @@ def interactive_delete(
             try:
                 valid.append((p.stat().st_mtime, str(p), p))
             except OSError as e:
-                print(f"  warning: group {i}: {e} -- skipping that file.", file=sys.stderr)
+                print(f"  warning: group {i}: {_display_err(e)} -- skipping that file.", file=sys.stderr)
         if len(valid) < 2:
             print(f"  warning: group {i}: fewer than 2 readable copies -- skipping group.",
                   file=sys.stderr)
@@ -442,7 +454,7 @@ def interactive_delete(
                     skipped += 1
                     continue
             except OSError as e:
-                print(style.bold_red(f"  error: {_display(path)}: {e}"), file=sys.stderr)
+                print(style.bold_red(f"  error: {_display(path)}: {_display_err(e)}"), file=sys.stderr)
                 errors += 1
                 continue
             try:
@@ -450,7 +462,7 @@ def interactive_delete(
                 print(style.red(f"  deleted: {_display(path)}"))
                 deleted += 1
             except OSError as e:
-                print(style.bold_red(f"  error: {_display(path)}: {e}"), file=sys.stderr)
+                print(style.bold_red(f"  error: {_display(path)}: {_display_err(e)}"), file=sys.stderr)
                 errors += 1
     except KeyboardInterrupt:
         print("\nInterrupted -- stopping deletion.", file=sys.stderr)
@@ -538,10 +550,10 @@ def main() -> int:
 
     root = Path(args.directory).expanduser().resolve()
     if not root.exists():
-        print(style.bold_red(f"error: directory not found: {root}"), file=sys.stderr)
+        print(style.bold_red(f"error: directory not found: {_display(root)}"), file=sys.stderr)
         return EXIT_ERROR
     if not root.is_dir():
-        print(style.bold_red(f"error: not a directory: {root}"), file=sys.stderr)
+        print(style.bold_red(f"error: not a directory: {_display(root)}"), file=sys.stderr)
         return EXIT_ERROR
 
     min_bytes = args.min_size * 1024
@@ -549,7 +561,7 @@ def main() -> int:
 
     # Progress always goes to stderr so --json stdout stays clean.
     if not args.quiet:
-        print(style.dim(f"Scanning {root}"), file=sys.stderr)
+        print(style.dim(f"Scanning {_display(root)}"), file=sys.stderr)
         print(style.dim(f"Min size: {fmt_size(min_bytes)}  |  "
                         f"skip dirs: {len(SKIP_DIRS)}"), file=sys.stderr)
 
