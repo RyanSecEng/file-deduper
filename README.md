@@ -10,10 +10,10 @@ Duplicate files pile up over time. You download the same installer twice, copy a
 
 ## Features
 
-- **Content-based detection.** Duplicates are matched by SHA-256, not by name or size.
-- **Two-pass speed.** Files are grouped by size first (no reads needed), and only the size collisions get hashed. In a typical tree that skips reading the 60-80% of files whose size is already unique.
-- **Read-only by default.** A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
-- **Safe against changes.** Every file is re-hashed right before it's unlinked, so anything edited between the scan and the delete is skipped instead of removed.
+- Duplicates are matched by SHA-256 content hash, not by name or size.
+- Files are grouped by size first (no reads needed), and only the size collisions get hashed, so most files in a typical tree are never read.
+- Read-only by default. A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
+- Every file is re-hashed right before it's unlinked, so anything edited between the scan and the delete is skipped instead of removed.
 - Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
 - Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
 - `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.

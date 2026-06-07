@@ -28,8 +28,6 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# Constants
-
 SKIP_DIRS: frozenset[str] = frozenset({
     ".git", ".hg", ".svn",
     "node_modules", "__pycache__",
@@ -264,11 +262,7 @@ def report_text(
         return
 
     total_wasted = 0
-    groups = sorted(
-        duplicates.items(),
-        key=lambda kv: kv[1][0],  # sort by size (first element of tuple)
-        reverse=True,
-    )
+    groups = sorted(duplicates.items(), key=lambda kv: kv[1][0], reverse=True)
 
     for i, (h, (size, paths)) in enumerate(groups, 1):
         wasted = size * (len(paths) - 1)
@@ -379,7 +373,6 @@ def interactive_delete(
                   file=sys.stderr)
             continue
         valid.sort(key=lambda x: (x[0], x[1]))
-        # valid[0] is the oldest; keep it, delete the rest
         for mtime, _, p in valid[1:]:
             plan.append((i, p, size, mtime, h))
 
