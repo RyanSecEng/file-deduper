@@ -1,42 +1,35 @@
 # file-deduper
 
-A single-file Python command-line tool that finds duplicate files in a directory tree by comparing their SHA-256 hashes. It is **read-only by default** — it reports what it finds and only deletes anything when you explicitly opt in through two interactive confirmations.
+A single-file Python command-line tool that finds duplicate files in a directory tree by comparing their SHA-256 hashes. It is read-only by default: it reports what it finds, and only deletes anything after two explicit interactive confirmations.
 
 ## Why
 
-Duplicate files quietly accumulate: downloads grabbed twice, photos copied between folders, project assets pasted into a dozen places. They waste disk space and make a directory tree harder to reason about.
+Duplicate files pile up over time. You download the same installer twice, copy a photo folder "just in case," or paste the same asset into a few different projects. Comparing by name or size alone doesn't catch them reliably, since different files can share a size and identical files can have different names.
 
-Comparing by name or size alone is unreliable — different files can share a size, and identical files can have different names. `file-deduper` compares the actual *content* via SHA-256, so two files are only ever reported as duplicates when their bytes are genuinely identical. It is also built to be safe to point at real data: it never follows symlinks, never collapses hardlinks into false "wasted space," neutralizes hostile filenames before printing, and re-verifies every file's hash immediately before deleting it.
+`file-deduper` compares the actual file content, so two files are only reported as duplicates when their bytes match. It's also meant to be safe to point at real data: it skips symlinks, doesn't count hardlinks as wasted space, escapes hostile filenames before printing them, and re-checks every file's hash right before deleting it.
 
 ## Features
 
-- **Content-based detection** — duplicates are identified by SHA-256, not by name or size.
-- **Two-pass speed** — files are grouped by size first (free, no reads); only size-collision sets are actually hashed, which skips reading the often 60–80% of a tree whose sizes are unique.
-- **Read-only by default** — running the tool only reports; deletion is a separate, opt-in interactive step.
-- **Safe interactive cleanup** — keeps the oldest file in each group, requires two confirmations, lets you exclude specific groups, and re-hashes each file right before unlinking so anything changed since the scan is never deleted.
-- **JSON output** — `--json` emits machine-readable results on stdout (progress stays on stderr) for piping into other tools.
-- **Hardlink-aware** — multiple hardlinks to one inode are collapsed to a single entry, so they aren't reported as reclaimable duplicates.
-- **Symlink / special-file safe** — symlinks, FIFOs, sockets, and device files are skipped; TOCTOU windows around hashing are guarded with `O_NOFOLLOW` (POSIX) and re-checks (Windows).
-- **Sensible directory pruning** — skips common noise directories like `.git`, `node_modules`, `__pycache__`, `venv`, `dist`, `.idea`, `.vscode`, and more.
-- **Minimum-size filter** — `--min-size` ignores small files so trivial matches don't clutter results.
-- **Colorized, readable output** — semantic color highlights wasted space (yellow) and destructive actions (red); auto-disables when output isn't a terminal, when `NO_COLOR` is set, or with `--color never`.
-- **Quiet / verbose modes** — `--quiet` silences the banner and progress; `--verbose` adds elapsed time and hashing throughput.
-- **Live progress** — hashing progress is reported by bytes processed (not just file count), so scans of a few very large files still show movement.
-- **Script-friendly exit codes** — `0` (no duplicates), `2` (duplicates found), `1` (error), so CI and shell scripts can branch on the result.
-- **Hostile-filename safe output** — non-printable characters (newlines, ANSI escapes) are escaped on *every* path that reaches the terminal — the duplicate listing, the deletion plan, the scanned-root header, and even OS error messages (which embed the offending filename) — so a crafted filename can't rewrite your terminal or spoof the deletion plan.
-- **Cross-platform** — works on Windows, macOS, and Linux; reconfigures stdout to UTF-8 on Windows so Unicode paths print correctly.
+- **Content-based detection.** Duplicates are matched by SHA-256, not by name or size.
+- **Two-pass speed.** Files are grouped by size first (no reads needed), and only the size collisions get hashed. In a typical tree that skips reading the 60-80% of files whose size is already unique.
+- **Read-only by default.** A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
+- **Safe against changes.** Every file is re-hashed right before it's unlinked, so anything edited between the scan and the delete is skipped instead of removed.
+- Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
+- Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
+- `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.
+- Returns `0` (no duplicates), `2` (duplicates found), or `1` (error) so scripts and CI can branch on the result.
+- Runs on Windows, macOS, and Linux. Color output turns itself off when piped, when `NO_COLOR` is set, or with `--color never`.
 
 ## Requirements
 
-- **Python 3.8 or newer**
-- No third-party dependencies — uses only the Python standard library.
+- Python 3.8 or newer
+- No third-party dependencies; standard library only.
 
 ## Installation
 
-No package install is required. Just download the script.
+There's nothing to install. Download the script, or clone the repo:
 
 ```bash
-# Clone or copy the repository
 git clone https://github.com/RyanSecEng/file-deduper.git
 cd file-deduper
 
@@ -44,7 +37,7 @@ cd file-deduper
 chmod +x file-deduper.py
 ```
 
-You can then run it with `python file-deduper.py ...` (or `./file-deduper.py ...` on POSIX after `chmod`).
+Then run `python file-deduper.py ...` (or `./file-deduper.py ...` on POSIX after `chmod`).
 
 ## Example usage
 
@@ -63,9 +56,6 @@ python file-deduper.py ~/Documents --json > duplicates.json
 
 # Silence the banner/progress, or disable color for logging
 python file-deduper.py ~/Downloads --quiet --color never
-
-# Show elapsed time and hashing throughput
-python file-deduper.py ~/Pictures --verbose
 ```
 
 | Argument            | Description                                                              |
@@ -75,9 +65,9 @@ python file-deduper.py ~/Pictures --verbose
 | `--min-size KB`     | Skip files smaller than this many KB (default: 1).                       |
 | `--color {auto,always,never}` | When to colorize output (default: `auto`). Also honors `NO_COLOR`. |
 | `-q`, `--quiet`     | Suppress the banner and progress output on stderr.                       |
-| `-v`, `--verbose`   | Print extra detail (elapsed time and hashing throughput).               |
+| `-v`, `--verbose`   | Print extra detail (elapsed time and throughput).                        |
 
-After a text-mode report, if you are running in an interactive terminal you'll be offered an optional cleanup step. (When stdout is piped or `--json` is used, no prompt appears.)
+After a text-mode report, if you're at an interactive terminal you'll be offered an optional cleanup step. When stdout is piped or `--json` is used, no prompt appears.
 
 ### Exit codes
 
@@ -87,7 +77,7 @@ After a text-mode report, if you are running in an interactive terminal you'll b
 | `2`  | Ran successfully; duplicate groups found. |
 | `1`  | Error (e.g. the directory does not exist).|
 
-This makes the tool easy to use in scripts — for example, fail a CI job when duplicates appear:
+For example, to fail a CI job when duplicates appear:
 
 ```bash
 python file-deduper.py ./assets --json > dupes.json || \
@@ -151,42 +141,37 @@ JSON report (`--json`):
 
 ## How it works
 
-1. **Walk** — `os.walk` traverses the directory tree, pruning known noise directories in place so they're never descended into. Each file is examined with a single `lstat` call; symlinks, FIFOs, sockets, and device files (anything that isn't a regular file) are skipped, as are files below `--min-size`. Hardlinks are collapsed by `(device, inode)` so duplicate links to the same data aren't counted as wasted space.
-2. **Group by size** — files are bucketed by their byte size (already known from the walk, so no extra `stat` calls). Any size that appears only once cannot have a duplicate and is dropped immediately. This avoids reading the majority of files in a typical tree.
-3. **Hash candidates** — only the files sharing a size with at least one other file are read and SHA-256–hashed, in 64 KB chunks. Files with matching hashes are grouped together; progress is reported on stderr.
-4. **Report** — groups containing more than one file are sorted by file size (largest first) and printed as a text report or JSON, including per-group wasted bytes and a total.
-5. **Optional cleanup** (text mode, interactive terminal only) — you may delete redundant copies. The oldest file in each group is kept as the canonical original. You confirm once to opt in, may exclude specific groups, then review a full deletion plan and confirm a second time. Right before each file is unlinked it is re-hashed; if it changed since the scan it is skipped rather than deleted.
+1. **Walk.** `os.walk` traverses the tree, pruning known noise directories (`.git`, `node_modules`, `__pycache__`, `venv`, and so on) in place. Each file gets a single `lstat`; anything that isn't a regular file (symlink, FIFO, socket, device) is skipped, as are files below `--min-size`. Hardlinks are collapsed by `(device, inode)`.
+2. **Group by size.** Files are bucketed by byte size, which is already known from the walk. Any size that appears only once can't have a duplicate and is dropped, which avoids reading most of the files in a typical tree.
+3. **Hash candidates.** Only files that share a size are read and SHA-256 hashed, in 64 KB chunks. Matching hashes are grouped together, with progress on stderr.
+4. **Report.** Groups of more than one file are sorted largest first and printed as text or JSON, with per-group and total wasted bytes.
+5. **Optional cleanup** (text mode, interactive terminal only). The oldest file in each group is kept as the canonical copy. You confirm once to opt in, can exclude specific groups, then review the full deletion plan and confirm again. Each file is re-hashed right before it's unlinked; if it changed since the scan, it's skipped.
+
+## Testing
+
+The test suite uses only the standard library (`unittest`):
+
+```bash
+python -m unittest discover -s tests
+```
+
+It covers the size and hash grouping, hardlink and symlink handling, the filename escaping, and the deletion path that matters most: keep-oldest, group exclusion, and the re-hash-before-delete guard.
 
 ## Known limitations
 
-- **Hash-based, not byte-by-byte.** Matches rely on SHA-256. A collision is cryptographically infeasible in practice, but no separate byte comparison is performed.
-- **Reads candidate files fully.** Files that share a size are hashed in their entirety; scanning very large media libraries can be I/O-bound.
-- **Single-threaded.** Hashing is sequential; there is no parallelism.
-- **Snapshot in time.** Detection reflects the filesystem at scan time. The deletion step guards against changes by re-hashing, but the report itself can go stale if files change after scanning.
-- **"Oldest is kept" is not configurable.** Interactive cleanup always keeps the oldest copy per group; you can exclude whole groups but cannot choose a different file to keep within a group.
-- **No deletion in JSON / non-interactive mode.** Cleanup only runs in text mode at an interactive terminal; it is intentionally skipped for piped/scripted use.
-- **TOCTOU is reduced, not eliminated.** On Windows there is no `O_NOFOLLOW`, so a small race window remains despite the re-checks.
+- Matches rely on SHA-256, not a byte-by-byte comparison. A collision is cryptographically infeasible in practice, but it's worth knowing no separate byte check is done.
+- Files that share a size are hashed in full, so scanning very large media libraries can be I/O-bound.
+- Hashing is single-threaded; there's no parallelism.
+- Interactive cleanup always keeps the oldest copy in a group. You can exclude whole groups but can't pick a different file to keep within one.
+- Cleanup only runs in text mode at an interactive terminal. It's intentionally skipped for piped or scripted use, so `--json` never deletes anything.
+- TOCTOU is reduced, not eliminated. Windows has no `O_NOFOLLOW`, so a small race window remains despite the re-checks.
 
 ## Roadmap
 
-Engine and correctness work that is planned but not yet implemented:
-
 - Optional parallel hashing for large trees.
 - Optional byte-by-byte verification of hash matches.
-
-## UX roadmap
-
-User-experience improvements that make the tool friendlier and more flexible (some have placeholders in the argument parser):
-
-- `--move DEST` — move duplicate copies into a destination folder instead of deleting them.
-- `--ignore PATTERN` — skip paths matching an `fnmatch` glob pattern.
-- Configurable "keep" strategy via `--keep {oldest,newest,shortest-path}` (currently always keeps the oldest).
-- Per-group "keep" selection in the interactive prompt (choose which copy survives, not just exclude whole groups).
-- `--dry-run` — print the deletion plan without a terminal prompt, for previewing in scripts.
-- `--csv` output alongside `--json`, for spreadsheet users.
-- `--follow-symlinks` — opt in to following symlinks (off by default).
-- `--save-report FILE` — write the text report to a file.
+- `--ignore PATTERN` to skip paths by glob, and a configurable `--keep` strategy.
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+MIT. See the [LICENSE](LICENSE) file for details.

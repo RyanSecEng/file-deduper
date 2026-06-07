@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""file-deduper.py — find duplicate files by SHA-256 hash (read-only).
+"""file-deduper.py - find duplicate files by SHA-256 hash (read-only).
 
 Requires Python 3.8+
 
@@ -11,7 +11,7 @@ Options:
     --min-size KB       Minimum file size in KB to consider (default: 1)
     --color WHEN        Colorize output: auto (default) | always | never
     -q, --quiet         Suppress the banner and progress output
-    -v, --verbose       Print elapsed time and hashing throughput
+    -v, --verbose       Print elapsed time and throughput
 
 Exit codes: 0 = no duplicates, 2 = duplicates found, 1 = error.
 """
@@ -28,7 +28,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# Constants
 
 SKIP_DIRS: frozenset[str] = frozenset({
     ".git", ".hg", ".svn",
@@ -42,21 +42,17 @@ SKIP_DIRS: frozenset[str] = frozenset({
 DEFAULT_MIN_SIZE_KB = 1
 _HASH_CHUNK = 65_536  # 64 KB read buffer
 
-# Exit codes (documented in README): script-friendly so CI can branch on them.
-EXIT_OK = 0          # ran cleanly, no duplicates found
-EXIT_ERROR = 1       # usage error / bad path
-EXIT_DUPLICATES = 2  # ran cleanly, duplicates were found
+# Exit codes, so scripts can branch on the result.
+EXIT_OK = 0          # no duplicates
+EXIT_ERROR = 1       # bad path / usage error
+EXIT_DUPLICATES = 2  # duplicates found
 
 
-# ── Color / output styling ─────────────────────────────────────────────────────
+# Color / output styling
 
 class Style:
-    """ANSI color wrapper that no-ops when color is disabled.
-
-    Color is *semantic*, not decorative: yellow marks wasted space (the number
-    users act on), red marks destructive/error output, green marks all-clear.
-    A disabled Style returns text unchanged, so call sites never branch.
-    """
+    """ANSI color wrapper. When disabled it returns text unchanged, so call
+    sites never have to check whether color is on."""
     _CODES = {
         "cyan": "36", "dim": "2", "yellow": "33", "bold_yellow": "1;33",
         "red": "31", "bold_red": "1;31", "green": "32", "bold": "1",
@@ -69,20 +65,15 @@ class Style:
         return f"\033[{code}m{s}\033[0m" if self.enabled else s
 
     def __getattr__(self, name: str):
-        # style.yellow("...") etc. — resolved lazily from _CODES.
+        # style.yellow(...) etc., resolved from _CODES on first access.
         if name in Style._CODES:
             return lambda s: self._wrap(Style._CODES[name], s)
         raise AttributeError(name)
 
 
 def _enable_windows_vt() -> bool:
-    """Enable ANSI escape processing on legacy Windows consoles.
-
-    Modern Windows Terminal / PowerShell 7 already handle ANSI, but legacy
-    conhost needs ENABLE_VIRTUAL_TERMINAL_PROCESSING set explicitly. Returns
-    True if the console accepts ANSI (or we're not on Windows), False if we
-    couldn't enable it and color should be suppressed.
-    """
+    """Turn on ANSI handling for legacy Windows conhost (newer terminals
+    already do it). Returns True if color is usable, False if not."""
     if os.name != "nt":
         return True
     try:
@@ -100,14 +91,11 @@ def _enable_windows_vt() -> bool:
 
 
 def make_style(mode: str, stream) -> Style:
-    """Decide whether to colorize, honoring --color, NO_COLOR, and TTY state.
-
-    mode is 'auto' (color only at a TTY), 'always', or 'never'. The NO_COLOR
-    convention (https://no-color.org) wins over 'auto' but not over 'always'.
-    """
+    """Decide whether to colorize from --color, NO_COLOR, and TTY state."""
     if mode == "never":
         return Style(False)
     if mode == "auto":
+        # NO_COLOR overrides auto, but an explicit --color always still wins.
         if os.environ.get("NO_COLOR") is not None:
             return Style(False)
         if not (hasattr(stream, "isatty") and stream.isatty()):
@@ -130,21 +118,18 @@ def print_banner(style: Style, stream) -> None:
     print(file=stream)
 
 
-# ── Core logic ───────────────────────────────────────────────────────────────
+# Core logic
 
 def hash_file(path: Path) -> str:
     h = hashlib.sha256()
-    # O_NOFOLLOW (Unix only) closes the TOCTOU window between the lstat()
-    # check in walk_files and this open: if a regular file is swapped for a
-    # symlink in between, the open raises OSError instead of following it.
-    # O_BINARY is a no-op on Unix but required on Windows for binary mode.
+    # O_NOFOLLOW (Unix) closes the gap between walk_files' lstat and this open:
+    # a symlink swapped in now raises instead of being followed. O_BINARY is for
+    # Windows, no-op elsewhere.
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
-        # Windows lacks O_NOFOLLOW, so the open above will happily follow a
-        # symlink swapped in after walk_files' lstat. Re-check here: reject if
-        # the path is now a symlink, or if the opened object isn't a regular
-        # file. This shrinks (though cannot fully eliminate) the race window.
+        # Windows has no O_NOFOLLOW, so re-check the open fd and bail on a
+        # symlink or non-regular file. Shrinks the race; doesn't close it.
         if getattr(os, "O_NOFOLLOW", 0) == 0:
             if _stat.S_ISLNK(os.lstat(path).st_mode) or not _stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError(f"refusing to hash non-regular or symlinked file: {_display(path)}")
@@ -158,20 +143,16 @@ def hash_file(path: Path) -> str:
 
 
 def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tuple[int, Path]]:
-    """Return (size, path) pairs for regular files under root that are >= min_size bytes.
+    """(size, path) for every regular file >= min_size under root.
 
-    Uses lstat (no symlink follow) + S_ISREG in a single syscall per file:
-    symlinks, FIFOs, sockets, and device files all fail S_ISREG and are skipped.
-    Size is returned so callers never need to stat these files again.
-
-    Hardlinks are collapsed to a single entry per (device, inode): multiple
-    links share one inode and hash identically, but deleting one frees no
-    space, so they must not be reported as wasteful duplicates.
+    lstat skips symlinks/FIFOs/sockets/devices in one syscall and hands back the
+    size so callers don't stat again. Hardlinks are collapsed by (device, inode),
+    since deleting one of them frees nothing.
     """
     found: list[tuple[int, Path]] = []
     seen_inodes: set[tuple[int, int]] = set()
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune in-place so os.walk never descends into skipped dirs.
+        # prune in place so os.walk never descends into skipped dirs
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for name in filenames:
             p = Path(dirpath) / name
@@ -181,8 +162,8 @@ def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tup
                     continue
                 if st.st_size < min_size:
                     continue
-                # st_ino == 0 means the platform couldn't supply one; don't
-                # collapse in that case (better a false dup than a dropped file).
+                # st_ino == 0 means no inode from the platform; don't collapse
+                # then (a false dup is safer than dropping a file).
                 if st.st_ino:
                     key = (st.st_dev, st.st_ino)
                     if key in seen_inodes:
@@ -190,7 +171,7 @@ def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tup
                     seen_inodes.add(key)
                 found.append((st.st_size, p))
             except OSError:
-                pass  # unreadable / disappeared during scan
+                pass  # unreadable or gone since the walk started
     return found
 
 
@@ -199,23 +180,22 @@ def find_duplicates(
     style: Style | None = None,
     quiet: bool = False,
 ) -> dict[str, tuple[int, list[Path]]]:
-    """Return hash → (size_bytes, [paths]) for every SHA-256 that appears >1 time.
+    """Map hash -> (size, paths) for every SHA-256 seen more than once.
 
-    Two-pass: group by size first (free), then hash only size-collision sets.
-    This avoids reading files whose size is unique — often 60-80% of a tree.
-    Sizes come from walk_files so no stat calls are needed here.
+    Bucket by size first, then hash only the size collisions; the files whose
+    size is already unique are never read.
     """
     style = style or Style(False)
 
-    # Pass 1 — group by size (sizes already known, no stat needed)
+    # group by size (already known from the walk, no stat needed)
     by_size: dict[int, list[Path]] = defaultdict(list)
     for size, p in files:
         by_size[size].append(p)
 
     candidates = [(size, p) for size, ps in by_size.items() if len(ps) > 1 for p in ps]
 
-    # Pass 2 — hash candidates. Progress is byte-based, not file-count based:
-    # a tree of a few huge files would otherwise show nothing for a long time.
+    # Hash the candidates. Progress is measured in bytes, not file count, so a
+    # handful of huge files still shows movement.
     by_hash: dict[str, list[Path]] = defaultdict(list)
     hash_sizes: dict[str, int] = {}
     total = len(candidates)
@@ -231,7 +211,7 @@ def find_duplicates(
             pass
         done_bytes += size
         now = time.monotonic()
-        # Refresh at most ~5×/sec to avoid flooding stderr, plus a final line.
+        # throttle to ~5 updates/sec so we don't flood stderr, plus a final line
         if not quiet and (now - last_tick > 0.2 or i == total):
             last_tick = now
             pct = (done_bytes / total_bytes * 100) if total_bytes else 100
@@ -243,7 +223,7 @@ def find_duplicates(
     return {h: (hash_sizes[h], ps) for h, ps in by_hash.items() if len(ps) > 1}
 
 
-# ── Formatting helpers ────────────────────────────────────────────────────────
+# Formatting helpers
 
 def fmt_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -254,12 +234,8 @@ def fmt_size(n: float) -> str:
 
 
 def _display(path: object) -> str:
-    """Render a path safely for terminal output.
-
-    Filenames may legally contain newlines, carriage returns, or ANSI escape
-    sequences (on POSIX especially). Printing them raw lets a hostile filename
-    rewrite the terminal or spoof the deletion plan, so neutralize any
-    non-printable character while preserving ordinary Unicode text.
+    """Escape non-printable characters (newlines, ANSI escapes) in a path so a
+    hostile filename can't rewrite the terminal. Ordinary Unicode is left as-is.
     """
     return "".join(
         ch if (ch == " " or ch.isprintable()) else f"\\x{ord(ch):02x}"
@@ -268,18 +244,13 @@ def _display(path: object) -> str:
 
 
 def _display_err(e: object) -> str:
-    """Render an exception safely for terminal output.
-
-    OSError stringifies with the offending filename appended (e.g.
-    "[Errno 2] No such file or directory: '/path/with/\\x1b[2J'"), so a hostile
-    filename can smuggle escape sequences in through the *error* path even when
-    the path itself was sanitized separately. Route every exception through the
-    same neutralizer as paths.
+    """Like _display, but for exceptions. OSError puts the offending filename in
+    its message, so escapes can ride in through the error text too.
     """
     return _display(str(e))
 
 
-# ── Reporters ─────────────────────────────────────────────────────────────────
+# Reporters
 
 def report_text(
     root: Path,
@@ -341,25 +312,21 @@ def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
     }, indent=2, ensure_ascii=False))
 
 
-# ── Interactive cleanup ───────────────────────────────────────────────────────
+# Interactive cleanup
 
 def interactive_delete(
     duplicates: dict[str, tuple[int, list[Path]]],
     style: Style | None = None,
 ) -> None:
-    """Prompt the user to delete redundant copies from each duplicate group.
+    """Offer to delete the redundant copies, keeping the oldest in each group.
 
-    The oldest file in each group is kept as the canonical original; every other
-    copy is deleted, so a group of N copies collapses to a single file.
-
-    Never runs automatically: requires two explicit confirmations from the user.
-    Silently skips if stdin is not a terminal (piped/scripted usage).
+    Requires two confirmations and does nothing when stdin isn't a terminal.
     """
     style = style or Style(False)
     if not sys.stdin.isatty():
         return
 
-    # Groups in same order as report_text (largest first)
+    # same order as report_text (largest first)
     groups = sorted(duplicates.items(), key=lambda kv: kv[1][0], reverse=True)
 
     try:
@@ -373,7 +340,6 @@ def interactive_delete(
         print("No files deleted.")
         return
 
-    # Ask for exclusions
     try:
         raw = input(
             f"Exclude groups by number (1-{len(groups)}), comma-separated"
@@ -394,14 +360,14 @@ def interactive_delete(
         except ValueError:
             print(f"  warning: '{_display(tok)}' is not a number, ignoring.", file=sys.stderr)
 
-    # Build deletion plan: keep the oldest file in each group, delete the rest.
-    # Each entry carries the group hash so it can be re-verified before unlink.
+    # Build the plan: keep oldest, delete the rest. Each entry carries its
+    # group hash for the re-check just before unlinking.
     plan: list[tuple[int, Path, int, float, str]] = []  # (group_num, path, size, mtime, hash)
     for i, (h, (size, paths)) in enumerate(groups, 1):
         if i in excluded:
             continue
-        # Stat each path independently so one unreadable copy doesn't sink the
-        # whole group; tiebreak on path string for determinism.
+        # stat each copy on its own so one bad file doesn't sink the group;
+        # tiebreak on path for a stable order
         valid: list[tuple[float, str, Path]] = []
         for p in paths:
             try:
@@ -413,7 +379,7 @@ def interactive_delete(
                   file=sys.stderr)
             continue
         valid.sort(key=lambda x: (x[0], x[1]))
-        # valid[0] is the oldest -> kept as the canonical original.
+        # valid[0] is the oldest; keep it, delete the rest
         for mtime, _, p in valid[1:]:
             plan.append((i, p, size, mtime, h))
 
@@ -445,8 +411,8 @@ def interactive_delete(
     skipped = 0
     try:
         for _, path, _, _, group_hash in plan:
-            # Re-hash immediately before unlinking: a file modified between the
-            # scan and now is no longer a confirmed duplicate, so never delete it.
+            # re-hash right before unlinking; if it changed since the scan it's
+            # no longer a confirmed copy, so skip it
             try:
                 if hash_file(path) != group_hash:
                     print(style.yellow(f"  skipped (changed since scan): {_display(path)}"),
@@ -475,7 +441,7 @@ def interactive_delete(
     print(summary + ".")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# CLI
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -506,7 +472,7 @@ examples:
         "--color",
         choices=("auto", "always", "never"),
         default="auto",
-        help="When to colorize output (default: auto — color only at a TTY; "
+        help="When to colorize output (default: auto, color only at a TTY; "
              "also honors the NO_COLOR env var)",
     )
     verbosity = p.add_mutually_exclusive_group()
@@ -518,19 +484,13 @@ examples:
     verbosity.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Print extra detail (elapsed time and hashing throughput)",
+        help="Print extra detail (elapsed time and throughput)",
     )
-    # Roadmap placeholders — not wired up yet, but accepted so callers don't break
-    # when we add them in a future version.
-    # p.add_argument("--move", metavar="DEST", help="[roadmap] Move dupes to DEST folder")
-    # p.add_argument("--ignore", metavar="PATTERN", action="append",
-    #                help="[roadmap] Skip paths matching PATTERN (fnmatch)")
     return p
 
 
 def main() -> int:
-    # Ensure both streams can emit Unicode file paths on Windows (default is
-    # cp1252): stdout carries the report, stderr the banner/progress/paths.
+    # Windows streams default to cp1252; force UTF-8 so Unicode paths print.
     for _stream in (sys.stdout, sys.stderr):
         if hasattr(_stream, "reconfigure"):
             _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -541,8 +501,8 @@ def main() -> int:
     if args.min_size < 1:
         parser.error("--min-size must be at least 1")
 
-    # Color follows whichever stream carries the report: stdout for JSON, but
-    # the human-facing report and banner are judged against stderr's TTY state.
+    # judge color against the stream that carries the report: stdout for JSON,
+    # stderr for the human-facing text report and banner
     style = make_style(args.color, sys.stdout if args.json else sys.stderr)
 
     if not args.json and not args.quiet:
