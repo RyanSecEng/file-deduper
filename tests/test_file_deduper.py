@@ -112,14 +112,14 @@ class WalkFilesTests(TempDirTestCase):
         self.write("a.bin", b"x" * 100)
         self.write("sub/b.bin", b"y" * 100)
         found = fd.walk_files(self.root, min_size=0, skip_dirs=fd.SKIP_DIRS)
-        names = sorted(p.name for _, p in found)
+        names = sorted(p.name for _, p, _ in found)
         self.assertEqual(names, ["a.bin", "b.bin"])
 
     def test_min_size_filter(self):
         self.write("small.bin", b"x" * 10)
         self.write("big.bin", b"x" * 5000)
         found = fd.walk_files(self.root, min_size=1000, skip_dirs=fd.SKIP_DIRS)
-        names = [p.name for _, p in found]
+        names = [p.name for _, p, _ in found]
         self.assertEqual(names, ["big.bin"])
 
     def test_prunes_skip_dirs(self):
@@ -127,7 +127,7 @@ class WalkFilesTests(TempDirTestCase):
         self.write("node_modules/pkg/index.js", b"b" * 50)
         self.write(".git/objects/deadbeef", b"c" * 50)
         found = fd.walk_files(self.root, min_size=0, skip_dirs=fd.SKIP_DIRS)
-        names = [p.name for _, p in found]
+        names = [p.name for _, p, _ in found]
         self.assertEqual(names, ["keep.bin"])
 
     def test_returned_size_matches_bytes(self):
@@ -155,7 +155,7 @@ class WalkFilesTests(TempDirTestCase):
         except (OSError, NotImplementedError, AttributeError) as e:
             self.skipTest(f"symlinks unsupported here: {e}")
         found = fd.walk_files(self.root, min_size=0, skip_dirs=fd.SKIP_DIRS)
-        names = [p.name for _, p in found]
+        names = [p.name for _, p, _ in found]
         self.assertEqual(names, ["real.bin"])
 
 
@@ -331,6 +331,28 @@ class InteractiveDeleteTests(TempDirTestCase):
 
         self.assertTrue(old.exists(), "kept original untouched")
         self.assertTrue(new.exists(), "changed file must be skipped, not deleted")
+
+    def test_inode_mismatch_skips_file(self):
+        # If the inode recorded at scan time no longer matches the file on disk,
+        # it was swapped after the scan and must not be deleted.
+        old = self.write("old.bin", b"identical", mtime=1000)
+        new = self.write("new.bin", b"identical", mtime=2000)
+        files = fd.walk_files(self.root, 0, fd.SKIP_DIRS)
+        dups = fd.find_duplicates(files, quiet=True)
+
+        inodes = {p: key for _, p, key in files}
+        inodes[new] = (-1, -1)  # pretend new.bin was a different inode at scan
+
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = True
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", fake_stdin), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, inodes=inodes)
+
+        self.assertTrue(old.exists(), "kept original untouched")
+        self.assertTrue(new.exists(), "swapped file must be skipped, not deleted")
 
     def test_excluded_group_is_untouched(self):
         a = self.write("a.bin", b"dup", mtime=1000)

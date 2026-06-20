@@ -118,36 +118,50 @@ def print_banner(style: Style, stream) -> None:
 
 # Core logic
 
-def hash_file(path: Path) -> str:
-    h = hashlib.sha256()
-    # O_NOFOLLOW (Unix) closes the gap between walk_files' lstat and this open:
+def _open_nofollow(path: Path) -> int:
+    # O_NOFOLLOW (Unix) closes the gap between an earlier lstat and this open:
     # a symlink swapped in now raises instead of being followed. O_BINARY is for
     # Windows, no-op elsewhere.
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
-    try:
+    if getattr(os, "O_NOFOLLOW", 0) == 0:
         # Windows has no O_NOFOLLOW, so re-check the open fd and bail on a
         # symlink or non-regular file. Shrinks the race; doesn't close it.
-        if getattr(os, "O_NOFOLLOW", 0) == 0:
+        try:
             if _stat.S_ISLNK(os.lstat(path).st_mode) or not _stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(f"refusing to hash non-regular or symlinked file: {_display(path)}")
-    except Exception:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, "rb") as f:
-        while chunk := f.read(_HASH_CHUNK):
-            h.update(chunk)
+                raise OSError(f"refusing to open non-regular or symlinked file: {_display(path)}")
+        except Exception:
+            os.close(fd)
+            raise
+    return fd
+
+
+def _hash_fd(fd: int) -> str:
+    h = hashlib.sha256()
+    while chunk := os.read(fd, _HASH_CHUNK):
+        h.update(chunk)
     return h.hexdigest()
 
 
-def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tuple[int, Path]]:
-    """(size, path) for every regular file >= min_size under root.
+def hash_file(path: Path) -> str:
+    fd = _open_nofollow(path)
+    try:
+        return _hash_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def walk_files(
+    root: Path, min_size: int, skip_dirs: frozenset[str]
+) -> list[tuple[int, Path, tuple[int, int] | None]]:
+    """(size, path, inode_key) for every regular file >= min_size under root.
 
     lstat skips symlinks/FIFOs/sockets/devices in one syscall and hands back the
-    size so callers don't stat again. Hardlinks are collapsed by (device, inode),
-    since deleting one of them frees nothing.
+    size so callers don't stat again. The (device, inode) key is recorded so a
+    later delete can confirm it is unlinking the same file that was scanned;
+    hardlinks are collapsed by that same key, since deleting one frees nothing.
     """
-    found: list[tuple[int, Path]] = []
+    found: list[tuple[int, Path, tuple[int, int] | None]] = []
     seen_inodes: set[tuple[int, int]] = set()
     for dirpath, dirnames, filenames in os.walk(root):
         # prune in place so os.walk never descends into skipped dirs
@@ -162,19 +176,19 @@ def walk_files(root: Path, min_size: int, skip_dirs: frozenset[str]) -> list[tup
                     continue
                 # st_ino == 0 means no inode from the platform; don't collapse
                 # then (a false dup is safer than dropping a file).
-                if st.st_ino:
-                    key = (st.st_dev, st.st_ino)
+                key = (st.st_dev, st.st_ino) if st.st_ino else None
+                if key is not None:
                     if key in seen_inodes:
                         continue
                     seen_inodes.add(key)
-                found.append((st.st_size, p))
+                found.append((st.st_size, p, key))
             except OSError:
                 pass  # unreadable or gone since the walk started
     return found
 
 
 def find_duplicates(
-    files: list[tuple[int, Path]],
+    files: list[tuple[int, Path, tuple[int, int] | None]],
     style: Style | None = None,
     quiet: bool = False,
 ) -> dict[str, tuple[int, list[Path]]]:
@@ -187,7 +201,7 @@ def find_duplicates(
 
     # group by size (already known from the walk, no stat needed)
     by_size: dict[int, list[Path]] = defaultdict(list)
-    for size, p in files:
+    for size, p, _ in files:
         by_size[size].append(p)
 
     candidates = [(size, p) for size, ps in by_size.items() if len(ps) > 1 for p in ps]
@@ -308,9 +322,39 @@ def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
 
 # Interactive cleanup
 
+def _delete_verified(path: Path, expected_key: tuple[int, int] | None, expected_hash: str) -> str:
+    """Confirm the file is still the scanned copy, then remove it.
+
+    Opens it without following symlinks, checks the (device, inode) recorded at
+    scan time and the SHA-256 both still match, then unlinks relative to the
+    parent directory so the entry removed is the one that was checked. Returns
+    "deleted" or "skipped"; raises OSError on an open or unlink failure.
+    """
+    fd = _open_nofollow(path)
+    try:
+        st = os.fstat(fd)
+        if expected_key is not None and (st.st_dev, st.st_ino) != expected_key:
+            return "skipped"
+        if _hash_fd(fd) != expected_hash:
+            return "skipped"
+    finally:
+        os.close(fd)
+
+    if os.unlink in os.supports_dir_fd:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.unlink(path.name, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    else:
+        path.unlink()
+    return "deleted"
+
+
 def interactive_delete(
     duplicates: dict[str, tuple[int, list[Path]]],
     style: Style | None = None,
+    inodes: dict[Path, tuple[int, int] | None] | None = None,
 ) -> None:
     """Offer to delete the redundant copies, keeping the oldest in each group.
 
@@ -404,25 +448,20 @@ def interactive_delete(
     skipped = 0
     try:
         for _, path, _, _, group_hash in plan:
-            # re-hash right before unlinking; if it changed since the scan it's
-            # no longer a confirmed copy, so skip it
+            expected_key = inodes.get(path) if inodes else None
             try:
-                if hash_file(path) != group_hash:
-                    print(style.yellow(f"  skipped (changed since scan): {_display(path)}"),
-                          file=sys.stderr)
-                    skipped += 1
-                    continue
+                result = _delete_verified(path, expected_key, group_hash)
             except OSError as e:
                 print(style.bold_red(f"  error: {_display(path)}: {_display_err(e)}"), file=sys.stderr)
                 errors += 1
                 continue
-            try:
-                path.unlink()
+            if result == "skipped":
+                print(style.yellow(f"  skipped (changed since scan): {_display(path)}"),
+                      file=sys.stderr)
+                skipped += 1
+            else:
                 print(style.red(f"  deleted: {_display(path)}"))
                 deleted += 1
-            except OSError as e:
-                print(style.bold_red(f"  error: {_display(path)}: {_display_err(e)}"), file=sys.stderr)
-                errors += 1
     except KeyboardInterrupt:
         print("\nInterrupted -- stopping deletion.", file=sys.stderr)
 
@@ -519,6 +558,7 @@ def main() -> int:
                         f"skip dirs: {len(SKIP_DIRS)}"), file=sys.stderr)
 
     files = walk_files(root, min_bytes, SKIP_DIRS)
+    inodes = {p: key for _, p, key in files}
     if not args.quiet:
         print(style.dim(f"Files eligible: {len(files)}"), file=sys.stderr)
 
@@ -536,7 +576,7 @@ def main() -> int:
         elapsed = time.monotonic() - started
         msg = f"Done - {len(duplicates)} duplicate group(s) found."
         if args.verbose:
-            scanned = sum(size for size, _ in files)
+            scanned = sum(size for size, _, _ in files)
             rate = scanned / elapsed if elapsed else 0
             msg += (f"  [{elapsed:.1f}s, {len(files)} files, "
                     f"{fmt_size(scanned)} eligible, {fmt_size(rate)}/s]")
@@ -546,7 +586,7 @@ def main() -> int:
         report_json(root, duplicates)
     else:
         report_text(root, duplicates, style=style)
-        interactive_delete(duplicates, style=style)
+        interactive_delete(duplicates, style=style, inodes=inodes)
 
     return EXIT_DUPLICATES if duplicates else EXIT_OK
 

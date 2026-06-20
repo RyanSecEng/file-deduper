@@ -6,14 +6,14 @@ A single-file Python command-line tool that finds duplicate files in a directory
 
 Duplicate files pile up over time. You download the same installer twice, copy a photo folder "just in case," or paste the same asset into a few different projects. Comparing by name or size alone doesn't catch them reliably, since different files can share a size and identical files can have different names.
 
-`file-deduper` compares the actual file content, so two files are only reported as duplicates when their bytes match. It's also meant to be safe to point at real data: it skips symlinks, doesn't count hardlinks as wasted space, escapes hostile filenames before printing them, and re-checks every file's hash right before deleting it.
+`file-deduper` compares the actual file content, so two files are only reported as duplicates when their bytes match. It's also meant to be safe to point at real data: it skips symlinks, doesn't count hardlinks as wasted space, escapes hostile filenames before printing them, and re-checks each file's inode and hash right before deleting it.
 
 ## Features
 
 - Duplicates are matched by SHA-256 content hash, not by name or size.
 - Files are grouped by size first (no reads needed), and only the size collisions get hashed, so most files in a typical tree are never read.
 - Read-only by default. A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
-- Every file is re-hashed right before it's unlinked, so anything edited between the scan and the delete is skipped instead of removed.
+- Before any file is unlinked it is reopened without following symlinks, checked against the device and inode recorded during the scan, re-hashed, and then removed relative to its parent directory, so a file edited or swapped between the scan and the delete is skipped instead of removed.
 - Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
 - Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
 - `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.
@@ -145,7 +145,7 @@ JSON report (`--json`):
 2. **Group by size.** Files are bucketed by byte size, which is already known from the walk. Any size that appears only once can't have a duplicate and is dropped, which avoids reading most of the files in a typical tree.
 3. **Hash candidates.** Only files that share a size are read and SHA-256 hashed, in 64 KB chunks. Matching hashes are grouped together, with progress on stderr.
 4. **Report.** Groups of more than one file are sorted largest first and printed as text or JSON, with per-group and total wasted bytes.
-5. **Optional cleanup** (text mode, interactive terminal only). The oldest file in each group is kept as the canonical copy. You confirm once to opt in, can exclude specific groups, then review the full deletion plan and confirm again. Each file is re-hashed right before it's unlinked; if it changed since the scan, it's skipped.
+5. **Optional cleanup** (text mode, interactive terminal only). The oldest file in each group is kept as the canonical copy. You confirm once to opt in, can exclude specific groups, then review the full deletion plan and confirm again. Right before each file is unlinked it is reopened without following symlinks and checked against the device/inode recorded during the scan and re-hashed; if either no longer matches, it's skipped. The unlink itself is done relative to the parent directory where the platform supports it, so the entry removed is the one that was checked.
 
 ## Testing
 
@@ -155,7 +155,7 @@ The test suite uses only the standard library (`unittest`):
 python -m unittest discover -s tests
 ```
 
-It covers the size and hash grouping, hardlink and symlink handling, the filename escaping, and the deletion path that matters most: keep-oldest, group exclusion, and the re-hash-before-delete guard.
+It covers the size and hash grouping, hardlink and symlink handling, the filename escaping, and the deletion path that matters most: keep-oldest, group exclusion, and the inode and re-hash guards before delete.
 
 ## Known limitations
 
@@ -164,7 +164,7 @@ It covers the size and hash grouping, hardlink and symlink handling, the filenam
 - Hashing is single-threaded; there's no parallelism.
 - Interactive cleanup always keeps the oldest copy in a group. You can exclude whole groups but can't pick a different file to keep within one.
 - Cleanup only runs in text mode at an interactive terminal. It's intentionally skipped for piped or scripted use, so `--json` never deletes anything.
-- TOCTOU is reduced, not eliminated. Windows has no `O_NOFOLLOW`, so a small race window remains despite the re-checks.
+- TOCTOU is reduced, not eliminated. The inode check, re-hash, and directory-relative unlink narrow the window between the scan and the delete, but Windows has no `O_NOFOLLOW` and no portable unlink-by-descriptor exists, so a small race remains.
 
 ## Roadmap
 
