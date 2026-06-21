@@ -13,16 +13,14 @@ Options:
     --delete            Enable the interactive deletion step (off by default;
                         without it the tool only reports)
     --max-deletes N     Refuse to delete more than N files in one run
-    --allow-system      Permit deletion in system/root locations or while
-                        elevated (protected system files are never deleted)
     -q, --quiet         Suppress the banner and progress output
     -v, --verbose       Print elapsed time and throughput
 
 Safety: the tool is read-only unless --delete is given. Deletion never touches
 files under system directories (Windows, /usr, /etc, and the like), files you
-don't own, or files outside the scanned directory; refuses system/root scans and
-elevated runs unless --allow-system; requires typing DELETE for scans outside
-$HOME; and never removes more than --max-deletes files in a single run.
+don't own, or files outside the scanned directory; it refuses system/root scans
+and elevated runs outright with no override; requires typing DELETE for scans
+outside $HOME; and never removes more than --max-deletes files in a single run.
 
 Exit codes: 0 = no duplicates, 2 = duplicates found, 1 = error.
 """
@@ -473,7 +471,8 @@ def _owned_by_caller(st: os.stat_result) -> bool:
 
 def _deletion_block_reasons(root: Path, protected_roots: list[Path]) -> list[str]:
     """Conditions under which the delete step is refused outright (unless the
-    user passes --allow-system). Per-file protection is separate and absolute."""
+    is refused. There is no override. Per-file protection is separate, and is
+    likewise absolute."""
     reasons: list[str] = []
     if _is_filesystem_root(root):
         reasons.append("the scan root is a filesystem/drive root")
@@ -520,18 +519,17 @@ def interactive_delete(
     style: Style | None = None,
     inodes: dict[Path, tuple[int, int] | None] | None = None,
     root: Path | None = None,
-    allow_system: bool = False,
     max_deletes: int = DEFAULT_MAX_DELETIONS,
 ) -> None:
     """Offer to delete the redundant copies, keeping the oldest in each group.
 
     Does nothing when stdin isn't a terminal. Several safety guards gate the
-    delete step: it is refused outright when the scan root is a system/drive
-    root or the tool is elevated (unless --allow-system); files under protected
+    delete step, none of them overridable: it is refused outright when the scan
+    root is a system/drive root or the tool is elevated; files under protected
     system directories, files the caller doesn't own, and files that resolve
-    outside the scan root are never offered for deletion (even with
-    --allow-system); a scan reaching outside the user's home requires typing
-    DELETE in full; and no single run will remove more than `max_deletes` files.
+    outside the scan root are never offered for deletion; a scan reaching outside
+    the user's home requires typing DELETE in full; and no single run will remove
+    more than `max_deletes` files.
     """
     style = style or Style(False)
     if not sys.stdin.isatty():
@@ -539,22 +537,16 @@ def interactive_delete(
 
     protected_roots = _protected_roots()
 
-    # Hard refusal in dangerous locations. --allow-system downgrades it to a
-    # loud warning but does not relax the per-file protection further down.
+    # Hard refusal in dangerous locations. There is deliberately no override:
+    # the tool will not delete in system/root locations or while elevated.
     block_reasons = _deletion_block_reasons(root, protected_roots) if root else []
     if block_reasons:
-        if not allow_system:
-            print(style.bold_red("\nRefusing to offer deletion here:"), file=sys.stderr)
-            for reason in block_reasons:
-                print(style.yellow(f"  - {reason}"), file=sys.stderr)
-            print("Deleting duplicates in system locations can break your OS.",
-                  file=sys.stderr)
-            print("If you are certain, re-run with --allow-system.", file=sys.stderr)
-            return
-        print(style.bold_red("\n--allow-system: deletion enabled in a risky location:"),
-              file=sys.stderr)
+        print(style.bold_red("\nRefusing to offer deletion here:"), file=sys.stderr)
         for reason in block_reasons:
             print(style.yellow(f"  - {reason}"), file=sys.stderr)
+        print("Deleting duplicates in system locations can break your OS.",
+              file=sys.stderr)
+        return
 
     # same order as report_text (largest first)
     groups = sorted(duplicates.items(), key=lambda kv: kv[1][0], reverse=True)
@@ -609,8 +601,8 @@ def interactive_delete(
         # tiebreak on path for a stable order
         valid: list[tuple[float, str, Path]] = []
         for p in paths:
-            # Files under a protected system directory are never candidates,
-            # not even with --allow-system. This is the hard floor.
+            # Files under a protected system directory are never candidates.
+            # This is the hard floor.
             if _is_protected(p, protected_roots):
                 protected_skipped += 1
                 continue
@@ -776,13 +768,6 @@ examples:
         help=f"Refuse to delete more than N files in a single run "
              f"(default: {DEFAULT_MAX_DELETIONS}).",
     )
-    p.add_argument(
-        "--allow-system",
-        action="store_true",
-        help="Permit the delete step to run in system/root locations or while "
-             "elevated. Files under protected system directories are never "
-             "deleted regardless of this flag.",
-    )
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument(
         "-q", "--quiet",
@@ -866,8 +851,7 @@ def main() -> int:
         report_text(root, duplicates, style=style)
         if args.delete:
             interactive_delete(duplicates, style=style, inodes=inodes,
-                               root=root, allow_system=args.allow_system,
-                               max_deletes=args.max_deletes)
+                               root=root, max_deletes=args.max_deletes)
         elif duplicates and not args.quiet:
             print(style.dim(
                 "\nReporting only. Re-run with --delete to remove duplicates "

@@ -15,7 +15,7 @@ Duplicate files pile up over time. You download the same installer twice, copy a
 - Read-only by default. A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
 - Before any file is unlinked it is reopened without following symlinks, checked against the device and inode recorded during the scan, re-hashed, and then removed relative to its parent directory, so a file edited or swapped between the scan and the delete is skipped instead of removed.
 - Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
-- Won't delete inside the operating system. Files under protected system directories (Windows, `/usr`, `/etc`, and the like) are never offered for deletion, system/root scans and elevated runs are refused unless you pass `--allow-system`, and a scan reaching outside your home directory requires typing `DELETE` in full.
+- Won't delete inside the operating system. Files under protected system directories (Windows, `/usr`, `/etc`, and the like) are never offered for deletion, system/root scans and elevated runs are refused outright with no override, and a scan reaching outside your home directory requires typing `DELETE` in full.
 - Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
 - `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.
 - Returns `0` (no duplicates), `2` (duplicates found), or `1` (error) so scripts and CI can branch on the result.
@@ -70,7 +70,6 @@ python file-deduper.py ~/Downloads --delete
 | `--color {auto,always,never}` | When to colorize output (default: `auto`). Also honors `NO_COLOR`. |
 | `--delete`          | Enable the interactive deletion step. Off by default; without it the tool only reports. |
 | `--max-deletes N`   | Refuse to delete more than N files in one run (default: 10000).          |
-| `--allow-system`    | Permit deletion in system/root locations or while elevated. Protected system files are never deleted regardless. |
 | `-q`, `--quiet`     | Suppress the banner and progress output on stderr.                       |
 | `-v`, `--verbose`   | Print extra detail (elapsed time and throughput).                        |
 
@@ -169,7 +168,7 @@ is fenced accordingly, while reporting stays completely read-only:
 - **Protected system directories are off-limits.** Any candidate resolving under
   a known system root (`C:\Windows`, `C:\Program Files`, `%ProgramData%`, `/usr`,
   `/etc`, `/bin`, `/lib`, `/System`, `/Library`, and similar) is never added to
-  the deletion plan. This holds even with `--allow-system`; it is the hard floor.
+  the deletion plan. There is no flag that relaxes this; it is the hard floor.
 - **Only files you own.** A candidate not owned by the invoking user is skipped
   (POSIX uid check; on Windows the filesystem ACL already enforces this), so the
   tool won't remove another user's or a service account's files.
@@ -179,11 +178,11 @@ is fenced accordingly, while reporting stays completely read-only:
 - **Capped blast radius.** No single run will delete more than `--max-deletes`
   files (default 10,000); a larger plan is refused with advice to narrow the scan.
 - **System and root scans are refused.** If the scan root is a filesystem/drive
-  root or sits inside a protected directory, the delete step refuses outright.
-  `--allow-system` downgrades this to a loud warning for users who are certain.
+  root or sits inside a protected directory, the delete step refuses outright,
+  with no override.
 - **Elevated runs are refused.** Running as root or Administrator disables
-  deletion by default (again overridable with `--allow-system`), because that is
-  when a mistake does the most damage.
+  deletion entirely, because that is when a mistake does the most damage. Run the
+  tool as a normal user instead.
 - **Out-of-home scans demand a typed confirmation.** When the scan reaches
   outside your home directory, the final prompt requires typing `DELETE` in full
   rather than a single `y`, so it can't be muscle-memoried or coached over a call.

@@ -435,22 +435,22 @@ class DeletionGuardTests(TempDirTestCase):
         self.assertTrue(a.exists() and b.exists())
         inp.assert_not_called()
 
-    def test_allow_system_downgrades_refusal(self):
-        old = self.write("old.bin", b"identical", mtime=1000)
-        new = self.write("new.bin", b"identical", mtime=2000)
+    def test_elevated_refusal_has_no_override(self):
+        # There is no longer any flag to bypass the elevated refusal.
+        a = self.write("a.bin", b"dup", mtime=1000)
+        b = self.write("b.bin", b"dup", mtime=2000)
         dups = self._dups()
         out, err = _silence()
         with out, err, \
                 mock.patch.object(fd.sys, "stdin", self._tty()), \
                 mock.patch.object(fd, "_protected_roots", return_value=[]), \
                 mock.patch.object(fd, "_running_elevated", return_value=True), \
-                mock.patch.object(fd, "_home_dir", return_value=self.root), \
-                mock.patch("builtins.input", side_effect=["y", "", "y"]):
-            fd.interactive_delete(dups, root=self.root, allow_system=True)
-        self.assertTrue(old.exists())
-        self.assertFalse(new.exists(), "--allow-system should let deletion proceed")
+                mock.patch("builtins.input", side_effect=["y", "", "y"]) as inp:
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(a.exists() and b.exists())
+        inp.assert_not_called()
 
-    def test_protected_file_never_deleted_even_with_allow_system(self):
+    def test_protected_file_never_deleted(self):
         prot = self.write("sys/keep.bin", b"identical", mtime=1000)
         n1 = self.write("n1.bin", b"identical", mtime=2000)
         n2 = self.write("n2.bin", b"identical", mtime=3000)
@@ -463,7 +463,7 @@ class DeletionGuardTests(TempDirTestCase):
                 mock.patch.object(fd, "_running_elevated", return_value=False), \
                 mock.patch.object(fd, "_home_dir", return_value=self.root), \
                 mock.patch("builtins.input", side_effect=["y", "", "y"]):
-            fd.interactive_delete(dups, root=self.root, allow_system=True)
+            fd.interactive_delete(dups, root=self.root)
         self.assertTrue(prot.exists(), "protected copy must never be deleted")
         self.assertTrue(n1.exists(), "oldest non-protected copy kept")
         self.assertFalse(n2.exists(), "redundant non-protected copy deleted")
