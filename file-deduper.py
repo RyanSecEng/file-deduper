@@ -284,14 +284,8 @@ RULE_WIDTH = 62  # width of the section-header / footer rules
 
 
 def _rule(style: Style, label: str | None = None, width: int = RULE_WIDTH) -> str:
-    """A horizontal ASCII rule, optionally with an inline label:
-
-        -- Group 1 -------------------------------------------------
-        ------------------------------------------------------------
-
-    The label is bolded and the dashes are dimmed so headers read as
-    structure without shouting over the file paths underneath.
-    """
+    """A dashed rule, optionally with a bold inline label ("-- Group 1 ----").
+    Dashes are dimmed so headers frame the paths without shouting over them."""
     if label is None:
         return style.dim("-" * width)
     used = 3 + len(label) + 1  # "-- " + label + " "
@@ -357,23 +351,16 @@ def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
     }, indent=2, ensure_ascii=False))
 
 
-# Safety guards
-#
-# Deleting "duplicate" files inside system directories is how this tool could
-# wreck an OS or be turned against an unsuspecting user. Reporting stays fully
-# read-only; everything here only ever constrains the delete step.
+# Safety guards. These only ever gate the delete step; reporting stays read-only.
 
 LARGE_RESULT_GROUPS = 1000     # above this, warn that the scan looks system-wide
 DEFAULT_MAX_DELETIONS = 10_000  # refuse to remove more than this in one run
 
 
 def _is_within(child: Path, parent: Path) -> bool:
-    """True if child is parent itself or sits anywhere beneath it.
-
-    Both sides are resolved first (so symlinks/junctions can't smuggle a path
-    out of a protected tree) and compared with normcase, so Windows' case- and
-    separator-insensitivity is honored. Different drives -> False.
-    """
+    """True if child is parent or sits beneath it. Both sides are resolved first
+    (so a symlink can't smuggle a path out of the tree) and compared with
+    normcase for Windows case-insensitivity. Different drives -> False."""
     try:
         c = child.resolve()
         p = parent.resolve()
@@ -460,9 +447,8 @@ def _home_dir() -> Path | None:
 
 
 def _owned_by_caller(st: os.stat_result) -> bool:
-    """True if the invoking user owns the file. POSIX only; on Windows st_uid is
-    not meaningful and the filesystem ACL already blocks deleting files the user
-    has no rights to, so we don't second-guess it there."""
+    """True if the caller owns the file. POSIX only; on Windows st_uid is
+    meaningless and the filesystem ACL already enforces this."""
     try:
         return st.st_uid == os.geteuid()
     except AttributeError:  # Windows / no geteuid
@@ -470,9 +456,8 @@ def _owned_by_caller(st: os.stat_result) -> bool:
 
 
 def _deletion_block_reasons(root: Path, protected_roots: list[Path]) -> list[str]:
-    """Conditions under which the delete step is refused outright (unless the
-    is refused. There is no override. Per-file protection is separate, and is
-    likewise absolute."""
+    """Why the delete step is refused outright for this root, if at all. There's
+    no override; per-file protection (below) is a separate, equally hard floor."""
     reasons: list[str] = []
     if _is_filesystem_root(root):
         reasons.append("the scan root is a filesystem/drive root")
@@ -523,13 +508,10 @@ def interactive_delete(
 ) -> None:
     """Offer to delete the redundant copies, keeping the oldest in each group.
 
-    Does nothing when stdin isn't a terminal. Several safety guards gate the
-    delete step, none of them overridable: it is refused outright when the scan
-    root is a system/drive root or the tool is elevated; files under protected
-    system directories, files the caller doesn't own, and files that resolve
-    outside the scan root are never offered for deletion; a scan reaching outside
-    the user's home requires typing DELETE in full; and no single run will remove
-    more than `max_deletes` files.
+    Does nothing unless stdin is a terminal. The guards (none overridable): refuse
+    outright on a system/drive root or while elevated; never touch protected,
+    unowned, or out-of-root files; require typing DELETE when the scan is outside
+    $HOME; and stop at `max_deletes` files per run.
     """
     style = style or Style(False)
     if not sys.stdin.isatty():
@@ -537,8 +519,7 @@ def interactive_delete(
 
     protected_roots = _protected_roots()
 
-    # Hard refusal in dangerous locations. There is deliberately no override:
-    # the tool will not delete in system/root locations or while elevated.
+    # Refuse system/root locations and elevated runs. No override.
     block_reasons = _deletion_block_reasons(root, protected_roots) if root else []
     if block_reasons:
         print(style.bold_red("\nRefusing to offer deletion here:"), file=sys.stderr)
@@ -601,13 +582,10 @@ def interactive_delete(
         # tiebreak on path for a stable order
         valid: list[tuple[float, str, Path]] = []
         for p in paths:
-            # Files under a protected system directory are never candidates.
-            # This is the hard floor.
-            if _is_protected(p, protected_roots):
+            if _is_protected(p, protected_roots):  # system file, hard floor
                 protected_skipped += 1
                 continue
-            # Never delete anything that resolves outside what was scanned.
-            if root is not None and not _is_within(p, root):
+            if root is not None and not _is_within(p, root):  # outside the scan
                 outside_skipped += 1
                 continue
             try:
@@ -615,8 +593,7 @@ def interactive_delete(
             except OSError as e:
                 print(f"  warning: group {i}: {_display_err(e)} -- skipping that file.", file=sys.stderr)
                 continue
-            # Only ever delete files the caller owns.
-            if not _owned_by_caller(st):
+            if not _owned_by_caller(st):  # someone else's file
                 foreign_skipped += 1
                 continue
             valid.append((st.st_mtime, str(p), p))
@@ -655,9 +632,7 @@ def interactive_delete(
         print(f"  [group {group_num}]  {_display(path)}")
         print(style.dim(f"             size: {fmt_size(size)}  |  last modified: {ts}"))
 
-    # Scans reaching outside the user's home are exactly where a coached or
-    # careless deletion does the most damage, so demand the word DELETE in full
-    # rather than a one-key 'y' that can be muscle-memoried.
+    # Outside $HOME, demand the full word DELETE instead of a one-key 'y'.
     home = _home_dir()
     risky_scope = root is not None and (home is None or not _is_within(root, home))
     if risky_scope:
@@ -688,8 +663,7 @@ def interactive_delete(
     skipped = 0
     try:
         for _, path, _, _, group_hash in plan:
-            # Last-line assertion: never unlink anything outside the scan root,
-            # even if it somehow reached the plan.
+            # Last-line check: never unlink outside the scan root.
             if root is not None and not _is_within(path, root):
                 print(style.yellow(f"  skipped (outside scan root): {_display(path)}"),
                       file=sys.stderr)
