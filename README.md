@@ -1,6 +1,6 @@
 # file-deduper
 
-A single-file Python command-line tool that finds duplicate files in a directory tree by comparing their SHA-256 hashes. It is read-only by default: it reports what it finds, and only deletes anything after two explicit interactive confirmations.
+A single-file Python command-line tool that finds duplicate files in a directory tree by comparing their SHA-256 hashes. It is read-only unless you pass `--delete`: a normal run only reports what it finds, and even with `--delete` it removes nothing until you pass two explicit interactive confirmations through a stack of safety guards.
 
 ## Why
 
@@ -15,6 +15,7 @@ Duplicate files pile up over time. You download the same installer twice, copy a
 - Read-only by default. A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
 - Before any file is unlinked it is reopened without following symlinks, checked against the device and inode recorded during the scan, re-hashed, and then removed relative to its parent directory, so a file edited or swapped between the scan and the delete is skipped instead of removed.
 - Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
+- Won't delete inside the operating system. Files under protected system directories (Windows, `/usr`, `/etc`, and the like) are never offered for deletion, system/root scans and elevated runs are refused unless you pass `--allow-system`, and a scan reaching outside your home directory requires typing `DELETE` in full.
 - Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
 - `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.
 - Returns `0` (no duplicates), `2` (duplicates found), or `1` (error) so scripts and CI can branch on the result.
@@ -56,6 +57,9 @@ python file-deduper.py ~/Documents --json > duplicates.json
 
 # Silence the banner/progress, or disable color for logging
 python file-deduper.py ~/Downloads --quiet --color never
+
+# Opt in to the guarded interactive cleanup (read-only without --delete)
+python file-deduper.py ~/Downloads --delete
 ```
 
 | Argument            | Description                                                              |
@@ -64,10 +68,13 @@ python file-deduper.py ~/Downloads --quiet --color never
 | `--json`            | Emit results as JSON on stdout; progress messages go to stderr.          |
 | `--min-size KB`     | Skip files smaller than this many KB (default: 1).                       |
 | `--color {auto,always,never}` | When to colorize output (default: `auto`). Also honors `NO_COLOR`. |
+| `--delete`          | Enable the interactive deletion step. Off by default; without it the tool only reports. |
+| `--max-deletes N`   | Refuse to delete more than N files in one run (default: 10000).          |
+| `--allow-system`    | Permit deletion in system/root locations or while elevated. Protected system files are never deleted regardless. |
 | `-q`, `--quiet`     | Suppress the banner and progress output on stderr.                       |
 | `-v`, `--verbose`   | Print extra detail (elapsed time and throughput).                        |
 
-After a text-mode report, if you're at an interactive terminal you'll be offered an optional cleanup step. When stdout is piped or `--json` is used, no prompt appears.
+A normal run is read-only and never prompts. With `--delete`, and only at an interactive terminal, you're offered the guarded cleanup step; when stdout is piped or `--json` is used, no prompt appears.
 
 ### Exit codes
 
@@ -147,6 +154,45 @@ JSON report (`--json`):
 4. **Report.** Groups of more than one file are sorted largest first and printed as text or JSON, with per-group and total wasted bytes.
 5. **Optional cleanup** (text mode, interactive terminal only). The oldest file in each group is kept as the canonical copy. You confirm once to opt in, can exclude specific groups, then review the full deletion plan and confirm again. Right before each file is unlinked it is reopened without following symlinks and checked against the device/inode recorded during the scan and re-hashed; if either no longer matches, it's skipped. The unlink itself is done relative to the parent directory where the platform supports it, so the entry removed is the one that was checked.
 
+## Safety in system locations
+
+Pointed at a whole drive or a system tree, a content-based deduper will flag
+thousands of files that are *meant* to exist in more than one place: shared
+libraries, fonts, runtime DLLs, package caches. Deleting those can break the OS,
+and an unsuspecting user could be talked into doing exactly that. The delete step
+is fenced accordingly, while reporting stays completely read-only:
+
+- **Read-only by default.** Deletion only happens with an explicit `--delete`
+  flag. Without it the tool reports and exits, so a default run, however the
+  command is pointed, can never remove a file. Someone coaxed into running it
+  without that flag is never in danger.
+- **Protected system directories are off-limits.** Any candidate resolving under
+  a known system root (`C:\Windows`, `C:\Program Files`, `%ProgramData%`, `/usr`,
+  `/etc`, `/bin`, `/lib`, `/System`, `/Library`, and similar) is never added to
+  the deletion plan. This holds even with `--allow-system`; it is the hard floor.
+- **Only files you own.** A candidate not owned by the invoking user is skipped
+  (POSIX uid check; on Windows the filesystem ACL already enforces this), so the
+  tool won't remove another user's or a service account's files.
+- **Confined to the scan root.** Every candidate is checked to resolve inside the
+  directory that was scanned, both when the plan is built and again immediately
+  before each unlink, so no symlink or path trick can reach outside it.
+- **Capped blast radius.** No single run will delete more than `--max-deletes`
+  files (default 10,000); a larger plan is refused with advice to narrow the scan.
+- **System and root scans are refused.** If the scan root is a filesystem/drive
+  root or sits inside a protected directory, the delete step refuses outright.
+  `--allow-system` downgrades this to a loud warning for users who are certain.
+- **Elevated runs are refused.** Running as root or Administrator disables
+  deletion by default (again overridable with `--allow-system`), because that is
+  when a mistake does the most damage.
+- **Out-of-home scans demand a typed confirmation.** When the scan reaches
+  outside your home directory, the final prompt requires typing `DELETE` in full
+  rather than a single `y`, so it can't be muscle-memoried or coached over a call.
+- **Large result sets are flagged.** An unusually high group count prints a
+  warning that the scan looks system-wide before any deletion prompt.
+
+Resolution is done with symlinks and junctions followed and case-insensitivity
+honored, so a link or a case trick can't smuggle a path past these checks.
+
 ## Testing
 
 The test suite uses only the standard library (`unittest`):
@@ -165,12 +211,6 @@ It covers the size and hash grouping, hardlink and symlink handling, the filenam
 - Interactive cleanup always keeps the oldest copy in a group. You can exclude whole groups but can't pick a different file to keep within one.
 - Cleanup only runs in text mode at an interactive terminal. It's intentionally skipped for piped or scripted use, so `--json` never deletes anything.
 - TOCTOU is reduced, not eliminated. The inode check, re-hash, and directory-relative unlink narrow the window between the scan and the delete, but Windows has no `O_NOFOLLOW` and no portable unlink-by-descriptor exists, so a small race remains.
-
-## Roadmap
-
-- Optional parallel hashing for large trees.
-- Optional byte-by-byte verification of hash matches.
-- `--ignore PATTERN` to skip paths by glob, and a configurable `--keep` strategy.
 
 ## License
 

@@ -372,5 +372,231 @@ class InteractiveDeleteTests(TempDirTestCase):
                         "excluded group must be left intact")
 
 
+# Safety guard helpers
+
+class SafetyHelperTests(TempDirTestCase):
+    def test_is_within_true_for_descendant_and_self(self):
+        sub = self.write("a/b.txt", b"x")
+        self.assertTrue(fd._is_within(sub, self.root))
+        self.assertTrue(fd._is_within(self.root, self.root))
+
+    def test_is_within_false_for_sibling(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        self.assertFalse(fd._is_within(Path(other.name), self.root))
+
+    def test_filesystem_root_detected(self):
+        anchor = Path(self.root.anchor)  # "C:\\" on Windows, "/" on POSIX
+        self.assertTrue(fd._is_filesystem_root(anchor))
+        self.assertFalse(fd._is_filesystem_root(self.root))
+
+    def test_protected_roots_all_exist(self):
+        for r in fd._protected_roots():
+            self.assertTrue(r.exists(), f"{r} should exist to be listed")
+
+
+# Safety guards in interactive_delete
+
+class DeletionGuardTests(TempDirTestCase):
+    def _tty(self):
+        m = mock.Mock()
+        m.isatty.return_value = True
+        return m
+
+    def _dups(self):
+        return fd.find_duplicates(
+            fd.walk_files(self.root, 0, fd.SKIP_DIRS), quiet=True)
+
+    def test_refuses_when_root_is_protected(self):
+        a = self.write("a.bin", b"dup", mtime=1000)
+        b = self.write("b.bin", b"dup", mtime=2000)
+        dups = self._dups()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[self.root]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]) as inp:
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(a.exists() and b.exists(), "must delete nothing")
+        inp.assert_not_called()  # refused before any prompt
+
+    def test_refuses_when_elevated(self):
+        a = self.write("a.bin", b"dup", mtime=1000)
+        b = self.write("b.bin", b"dup", mtime=2000)
+        dups = self._dups()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=True), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]) as inp:
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(a.exists() and b.exists())
+        inp.assert_not_called()
+
+    def test_allow_system_downgrades_refusal(self):
+        old = self.write("old.bin", b"identical", mtime=1000)
+        new = self.write("new.bin", b"identical", mtime=2000)
+        dups = self._dups()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=True), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root, allow_system=True)
+        self.assertTrue(old.exists())
+        self.assertFalse(new.exists(), "--allow-system should let deletion proceed")
+
+    def test_protected_file_never_deleted_even_with_allow_system(self):
+        prot = self.write("sys/keep.bin", b"identical", mtime=1000)
+        n1 = self.write("n1.bin", b"identical", mtime=2000)
+        n2 = self.write("n2.bin", b"identical", mtime=3000)
+        dups = self._dups()
+        sysdir = self.root / "sys"
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[sysdir]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root, allow_system=True)
+        self.assertTrue(prot.exists(), "protected copy must never be deleted")
+        self.assertTrue(n1.exists(), "oldest non-protected copy kept")
+        self.assertFalse(n2.exists(), "redundant non-protected copy deleted")
+
+    def test_outside_home_requires_typed_delete(self):
+        old = self.write("old.bin", b"identical", mtime=1000)
+        new = self.write("new.bin", b"identical", mtime=2000)
+        dups = self._dups()
+        home = self.root / "elsewhere"
+        home.mkdir()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=home), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(old.exists() and new.exists(),
+                        "a one-key 'y' must not satisfy the DELETE confirmation")
+
+    def test_outside_home_typed_delete_proceeds(self):
+        old = self.write("old.bin", b"identical", mtime=1000)
+        new = self.write("new.bin", b"identical", mtime=2000)
+        dups = self._dups()
+        home = self.root / "elsewhere"
+        home.mkdir()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=home), \
+                mock.patch("builtins.input", side_effect=["y", "", "DELETE"]):
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(old.exists(), "oldest kept")
+        self.assertFalse(new.exists(), "typed DELETE should proceed")
+
+    def test_unowned_files_are_never_deleted(self):
+        old = self.write("old.bin", b"identical", mtime=1000)
+        new = self.write("new.bin", b"identical", mtime=2000)
+        dups = self._dups()
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch.object(fd, "_owned_by_caller", return_value=False), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(old.exists() and new.exists(),
+                        "files the caller doesn't own must never be deleted")
+
+    def test_max_deletes_cap_refuses_whole_run(self):
+        a = self.write("a.bin", b"identical", mtime=1000)
+        b = self.write("b.bin", b"identical", mtime=2000)
+        c = self.write("c.bin", b"identical", mtime=3000)
+        dups = self._dups()  # one group; plan would remove b and c
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root, max_deletes=1)
+        self.assertTrue(a.exists() and b.exists() and c.exists(),
+                        "a plan over the cap must be refused in full")
+
+    def test_candidate_outside_scan_root_never_deleted(self):
+        import hashlib
+        inside = self.write("inside.bin", b"identical", mtime=1000)
+        ext = tempfile.TemporaryDirectory()
+        self.addCleanup(ext.cleanup)
+        outside = Path(ext.name) / "outside.bin"
+        outside.write_bytes(b"identical")
+        os.utime(outside, (2000, 2000))
+        h = hashlib.sha256(b"identical").hexdigest()
+        dups = {h: (len(b"identical"), [inside, outside])}
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_protected_roots", return_value=[]), \
+                mock.patch.object(fd, "_running_elevated", return_value=False), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            fd.interactive_delete(dups, root=self.root)
+        self.assertTrue(outside.exists(),
+                        "a path outside the scan root must never be deleted")
+        self.assertTrue(inside.exists(),
+                        "with the outside copy filtered, the group has <2 candidates")
+
+
+# Read-only-by-default at the main() level
+
+class MainDeleteGatingTests(TempDirTestCase):
+    def _tty(self):
+        m = mock.Mock()
+        m.isatty.return_value = True
+        return m
+
+    def test_no_delete_flag_is_read_only(self):
+        # main() applies the default 1 KB minimum, so files must exceed it.
+        blob = b"identical" * 256  # ~2.3 KB
+        a = self.write("a.bin", blob, mtime=1000)
+        b = self.write("b.bin", blob, mtime=2000)
+        argv = ["file-deduper.py", str(self.root), "--color", "never"]
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "argv", argv), \
+                mock.patch.object(fd.sys, "stdin", self._tty()):
+            rc = fd.main()
+        self.assertTrue(a.exists() and b.exists(),
+                        "a run without --delete must never delete anything")
+        self.assertEqual(rc, fd.EXIT_DUPLICATES)
+
+    def test_delete_flag_enables_guarded_cleanup(self):
+        blob = b"identical" * 256  # exceed the default 1 KB minimum
+        old = self.write("old.bin", blob, mtime=1000)
+        new = self.write("new.bin", blob, mtime=2000)
+        argv = ["file-deduper.py", str(self.root), "--delete", "--color", "never"]
+        out, err = _silence()
+        with out, err, \
+                mock.patch.object(fd.sys, "argv", argv), \
+                mock.patch.object(fd.sys, "stdin", self._tty()), \
+                mock.patch.object(fd, "_home_dir", return_value=self.root), \
+                mock.patch("builtins.input", side_effect=["y", "", "y"]):
+            rc = fd.main()
+        self.assertTrue(old.exists(), "oldest kept")
+        self.assertFalse(new.exists(), "--delete should enable guarded deletion")
+        self.assertEqual(rc, fd.EXIT_DUPLICATES)
+
+
 if __name__ == "__main__":
     unittest.main()

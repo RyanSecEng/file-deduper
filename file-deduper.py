@@ -10,8 +10,19 @@ Options:
     --json              Output results as JSON (progress goes to stderr)
     --min-size KB       Minimum file size in KB to consider (default: 1)
     --color WHEN        Colorize output: auto (default) | always | never
+    --delete            Enable the interactive deletion step (off by default;
+                        without it the tool only reports)
+    --max-deletes N     Refuse to delete more than N files in one run
+    --allow-system      Permit deletion in system/root locations or while
+                        elevated (protected system files are never deleted)
     -q, --quiet         Suppress the banner and progress output
     -v, --verbose       Print elapsed time and throughput
+
+Safety: the tool is read-only unless --delete is given. Deletion never touches
+files under system directories (Windows, /usr, /etc, and the like), files you
+don't own, or files outside the scanned directory; refuses system/root scans and
+elevated runs unless --allow-system; requires typing DELETE for scans outside
+$HOME; and never removes more than --max-deletes files in a single run.
 
 Exit codes: 0 = no duplicates, 2 = duplicates found, 1 = error.
 """
@@ -102,6 +113,13 @@ def make_style(mode: str, stream) -> Style:
 
 
 BANNER = r"""
+        ||
+        ||
+        ||
+      __||__
+     /||||||\
+    /_||||||_\
+
   __ _ _        _        _
  / _(_) |___ __| |___ __| |_  _ _ __  ___ _ _
 |  _| | / -_) _` / -_) _` | || | '_ \/ -_) '_|
@@ -264,36 +282,57 @@ def _display_err(e: object) -> str:
 
 # Reporters
 
+RULE_WIDTH = 62  # width of the section-header / footer rules
+
+
+def _rule(style: Style, label: str | None = None, width: int = RULE_WIDTH) -> str:
+    """A horizontal ASCII rule, optionally with an inline label:
+
+        -- Group 1 -------------------------------------------------
+        ------------------------------------------------------------
+
+    The label is bolded and the dashes are dimmed so headers read as
+    structure without shouting over the file paths underneath.
+    """
+    if label is None:
+        return style.dim("-" * width)
+    used = 3 + len(label) + 1  # "-- " + label + " "
+    tail = "-" * max(3, width - used)
+    return f"{style.dim('--')} {style.bold(label)} {style.dim(tail)}"
+
+
 def report_text(
     root: Path,
     duplicates: dict[str, tuple[int, list[Path]]],
     style: Style | None = None,
 ) -> None:
     style = style or Style(False)
-    print(f"Scanned: {_display(root)}")
+    print(f"{style.dim('Scanned:')} {_display(root)}")
     if not duplicates:
         print(style.green("No duplicates found."))
         return
 
     total_wasted = 0
     groups = sorted(duplicates.items(), key=lambda kv: kv[1][0], reverse=True)
+    sep = style.dim(" | ")
 
     for i, (h, (size, paths)) in enumerate(groups, 1):
         wasted = size * (len(paths) - 1)
         total_wasted += wasted
-        print(
-            f"\n{style.bold(f'Group {i}')}: {len(paths)} copies  "
-            f"{fmt_size(size)} each  "
-            f"{style.yellow(f'{fmt_size(wasted)} wasted')}"
-        )
-        print(style.dim(f"  hash: {h[:16]}..."))
+        stats = sep.join((
+            f"{len(paths)} copies",
+            f"{fmt_size(size)} each",
+            style.yellow(f"{fmt_size(wasted)} wasted"),
+        ))
+        print(f"\n{_rule(style, f'Group {i}')}")
+        print(f"  {stats}")
+        print(style.dim(f"  sha256: {h[:16]}..."))
         for p in sorted(paths):
-            print(f"  {_display(p)}")
+            print(f"    {_display(p)}")
 
-    bar = "-" * 60
-    print(f"\n{bar}")
+    print(f"\n{_rule(style)}")
     print(
-        f"{len(duplicates)} group(s)  |  "
+        f"{len(duplicates)} group(s){sep}"
         f"{style.bold_yellow(f'{fmt_size(total_wasted)} wasted in total')}"
     )
 
@@ -318,6 +357,131 @@ def report_json(root: Path, duplicates: dict[str, tuple[int, list[Path]]]) -> No
         "total_wasted_bytes": total_wasted,
         "groups": groups,
     }, indent=2, ensure_ascii=False))
+
+
+# Safety guards
+#
+# Deleting "duplicate" files inside system directories is how this tool could
+# wreck an OS or be turned against an unsuspecting user. Reporting stays fully
+# read-only; everything here only ever constrains the delete step.
+
+LARGE_RESULT_GROUPS = 1000     # above this, warn that the scan looks system-wide
+DEFAULT_MAX_DELETIONS = 10_000  # refuse to remove more than this in one run
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """True if child is parent itself or sits anywhere beneath it.
+
+    Both sides are resolved first (so symlinks/junctions can't smuggle a path
+    out of a protected tree) and compared with normcase, so Windows' case- and
+    separator-insensitivity is honored. Different drives -> False.
+    """
+    try:
+        c = child.resolve()
+        p = parent.resolve()
+    except OSError:
+        return False
+    try:
+        common = os.path.commonpath((str(c), str(p)))
+    except ValueError:  # different drives, or mixed absolute/relative
+        return False
+    return os.path.normcase(common) == os.path.normcase(str(p))
+
+
+def _protected_roots() -> list[Path]:
+    """System directories whose files must never be deleted.
+
+    The filesystem/drive root itself is deliberately excluded (otherwise every
+    file would count as protected); that case is caught by the root check below.
+    """
+    if os.name == "nt":
+        candidates: list[str] = []
+        for var in ("SystemRoot", "windir", "ProgramFiles",
+                    "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
+            v = os.environ.get(var)
+            if v:
+                candidates.append(v)
+        candidates += [r"C:\Windows", r"C:\Program Files",
+                       r"C:\Program Files (x86)", r"C:\ProgramData"]
+    else:
+        candidates = [
+            "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libexec",
+            "/usr", "/etc", "/boot", "/sys", "/proc", "/dev", "/run", "/var",
+            "/opt",
+            # macOS
+            "/System", "/Library", "/Applications", "/private", "/cores",
+        ]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for c in candidates:
+        try:
+            p = Path(c).resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(p))
+        if key in seen or not p.exists():
+            continue
+        seen.add(key)
+        roots.append(p)
+    return roots
+
+
+def _is_protected(path: Path, roots: list[Path]) -> bool:
+    return any(_is_within(path, r) for r in roots)
+
+
+def _is_filesystem_root(path: Path) -> bool:
+    """True for `/`, `C:\\`, and other drive/volume roots (parent == self)."""
+    try:
+        p = path.resolve()
+    except OSError:
+        return False
+    return p.parent == p
+
+
+def _running_elevated() -> bool:
+    """root on POSIX, Administrator on Windows. Best-effort; False if unknown."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def _home_dir() -> Path | None:
+    try:
+        return Path.home().resolve()
+    except (RuntimeError, OSError):
+        return None
+
+
+def _owned_by_caller(st: os.stat_result) -> bool:
+    """True if the invoking user owns the file. POSIX only; on Windows st_uid is
+    not meaningful and the filesystem ACL already blocks deleting files the user
+    has no rights to, so we don't second-guess it there."""
+    try:
+        return st.st_uid == os.geteuid()
+    except AttributeError:  # Windows / no geteuid
+        return True
+
+
+def _deletion_block_reasons(root: Path, protected_roots: list[Path]) -> list[str]:
+    """Conditions under which the delete step is refused outright (unless the
+    user passes --allow-system). Per-file protection is separate and absolute."""
+    reasons: list[str] = []
+    if _is_filesystem_root(root):
+        reasons.append("the scan root is a filesystem/drive root")
+    elif _is_protected(root, protected_roots):
+        reasons.append("the scan root is inside a protected system directory")
+    if _running_elevated():
+        reasons.append("the tool is running as root/Administrator")
+    return reasons
 
 
 # Interactive cleanup
@@ -355,17 +519,51 @@ def interactive_delete(
     duplicates: dict[str, tuple[int, list[Path]]],
     style: Style | None = None,
     inodes: dict[Path, tuple[int, int] | None] | None = None,
+    root: Path | None = None,
+    allow_system: bool = False,
+    max_deletes: int = DEFAULT_MAX_DELETIONS,
 ) -> None:
     """Offer to delete the redundant copies, keeping the oldest in each group.
 
-    Requires two confirmations and does nothing when stdin isn't a terminal.
+    Does nothing when stdin isn't a terminal. Several safety guards gate the
+    delete step: it is refused outright when the scan root is a system/drive
+    root or the tool is elevated (unless --allow-system); files under protected
+    system directories, files the caller doesn't own, and files that resolve
+    outside the scan root are never offered for deletion (even with
+    --allow-system); a scan reaching outside the user's home requires typing
+    DELETE in full; and no single run will remove more than `max_deletes` files.
     """
     style = style or Style(False)
     if not sys.stdin.isatty():
         return
 
+    protected_roots = _protected_roots()
+
+    # Hard refusal in dangerous locations. --allow-system downgrades it to a
+    # loud warning but does not relax the per-file protection further down.
+    block_reasons = _deletion_block_reasons(root, protected_roots) if root else []
+    if block_reasons:
+        if not allow_system:
+            print(style.bold_red("\nRefusing to offer deletion here:"), file=sys.stderr)
+            for reason in block_reasons:
+                print(style.yellow(f"  - {reason}"), file=sys.stderr)
+            print("Deleting duplicates in system locations can break your OS.",
+                  file=sys.stderr)
+            print("If you are certain, re-run with --allow-system.", file=sys.stderr)
+            return
+        print(style.bold_red("\n--allow-system: deletion enabled in a risky location:"),
+              file=sys.stderr)
+        for reason in block_reasons:
+            print(style.yellow(f"  - {reason}"), file=sys.stderr)
+
     # same order as report_text (largest first)
     groups = sorted(duplicates.items(), key=lambda kv: kv[1][0], reverse=True)
+
+    if len(groups) > LARGE_RESULT_GROUPS:
+        print(style.bold_yellow(
+            f"\nWarning: {len(groups)} duplicate groups found. A result set this "
+            "large often means a system-wide or root scan -- review carefully."),
+            file=sys.stderr)
 
     try:
         answer = input(
@@ -401,6 +599,9 @@ def interactive_delete(
     # Build the plan: keep oldest, delete the rest. Each entry carries its
     # group hash for the re-check just before unlinking.
     plan: list[tuple[int, Path, int, float, str]] = []  # (group_num, path, size, mtime, hash)
+    protected_skipped = 0
+    outside_skipped = 0   # resolves outside the scan root
+    foreign_skipped = 0   # not owned by the caller
     for i, (h, (size, paths)) in enumerate(groups, 1):
         if i in excluded:
             continue
@@ -408,20 +609,50 @@ def interactive_delete(
         # tiebreak on path for a stable order
         valid: list[tuple[float, str, Path]] = []
         for p in paths:
+            # Files under a protected system directory are never candidates,
+            # not even with --allow-system. This is the hard floor.
+            if _is_protected(p, protected_roots):
+                protected_skipped += 1
+                continue
+            # Never delete anything that resolves outside what was scanned.
+            if root is not None and not _is_within(p, root):
+                outside_skipped += 1
+                continue
             try:
-                valid.append((p.stat().st_mtime, str(p), p))
+                st = p.stat()
             except OSError as e:
                 print(f"  warning: group {i}: {_display_err(e)} -- skipping that file.", file=sys.stderr)
+                continue
+            # Only ever delete files the caller owns.
+            if not _owned_by_caller(st):
+                foreign_skipped += 1
+                continue
+            valid.append((st.st_mtime, str(p), p))
         if len(valid) < 2:
-            print(f"  warning: group {i}: fewer than 2 readable copies -- skipping group.",
-                  file=sys.stderr)
             continue
         valid.sort(key=lambda x: (x[0], x[1]))
         for mtime, _, p in valid[1:]:
             plan.append((i, p, size, mtime, h))
 
+    for count, why in ((protected_skipped, "under protected system paths"),
+                       (outside_skipped, "outside the scan root"),
+                       (foreign_skipped, "not owned by you")):
+        if count:
+            print(style.dim(
+                f"  note: {count} copy/copies {why} were not offered for deletion."),
+                file=sys.stderr)
+
     if not plan:
         print("No files to delete after exclusions.")
+        return
+
+    # Cap the blast radius of any single run.
+    if len(plan) > max_deletes:
+        print(style.bold_red(
+            f"\nRefusing to delete {len(plan)} files in one run "
+            f"(limit {max_deletes})."), file=sys.stderr)
+        print("Narrow the scan, or raise the limit deliberately with "
+              "--max-deletes.", file=sys.stderr)
         return
 
     total_freed = sum(size for _, _, size, _, _ in plan)
@@ -432,22 +663,46 @@ def interactive_delete(
         print(f"  [group {group_num}]  {_display(path)}")
         print(style.dim(f"             size: {fmt_size(size)}  |  last modified: {ts}"))
 
-    try:
-        confirm = input(
-            style.bold_red("\nProceed with deletion? This cannot be undone.") + " [y/N]: "
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\nAborted.")
-        return
-    if confirm != "y":
-        print("Aborted. No files deleted.")
-        return
+    # Scans reaching outside the user's home are exactly where a coached or
+    # careless deletion does the most damage, so demand the word DELETE in full
+    # rather than a one-key 'y' that can be muscle-memoried.
+    home = _home_dir()
+    risky_scope = root is not None and (home is None or not _is_within(root, home))
+    if risky_scope:
+        try:
+            confirm = input(style.bold_red(
+                "\nThis scan is outside your home directory. Type DELETE to "
+                "confirm, anything else to abort: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+        if confirm != "DELETE":
+            print("Aborted. No files deleted.")
+            return
+    else:
+        try:
+            confirm = input(
+                style.bold_red("\nProceed with deletion? This cannot be undone.") + " [y/N]: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+        if confirm != "y":
+            print("Aborted. No files deleted.")
+            return
 
     deleted = 0
     errors = 0
     skipped = 0
     try:
         for _, path, _, _, group_hash in plan:
+            # Last-line assertion: never unlink anything outside the scan root,
+            # even if it somehow reached the plan.
+            if root is not None and not _is_within(path, root):
+                print(style.yellow(f"  skipped (outside scan root): {_display(path)}"),
+                      file=sys.stderr)
+                skipped += 1
+                continue
             expected_key = inodes.get(path) if inodes else None
             try:
                 result = _delete_verified(path, expected_key, group_hash)
@@ -507,6 +762,27 @@ examples:
         help="When to colorize output (default: auto, color only at a TTY; "
              "also honors the NO_COLOR env var)",
     )
+    p.add_argument(
+        "--delete",
+        action="store_true",
+        help="Enable the interactive deletion step. Without this flag the tool "
+             "only reports and can never delete anything.",
+    )
+    p.add_argument(
+        "--max-deletes",
+        type=int,
+        default=DEFAULT_MAX_DELETIONS,
+        metavar="N",
+        help=f"Refuse to delete more than N files in a single run "
+             f"(default: {DEFAULT_MAX_DELETIONS}).",
+    )
+    p.add_argument(
+        "--allow-system",
+        action="store_true",
+        help="Permit the delete step to run in system/root locations or while "
+             "elevated. Files under protected system directories are never "
+             "deleted regardless of this flag.",
+    )
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument(
         "-q", "--quiet",
@@ -532,6 +808,8 @@ def main() -> int:
 
     if args.min_size < 1:
         parser.error("--min-size must be at least 1")
+    if args.max_deletes < 1:
+        parser.error("--max-deletes must be at least 1")
 
     # judge color against the stream that carries the report: stdout for JSON,
     # stderr for the human-facing text report and banner
@@ -586,7 +864,14 @@ def main() -> int:
         report_json(root, duplicates)
     else:
         report_text(root, duplicates, style=style)
-        interactive_delete(duplicates, style=style, inodes=inodes)
+        if args.delete:
+            interactive_delete(duplicates, style=style, inodes=inodes,
+                               root=root, allow_system=args.allow_system,
+                               max_deletes=args.max_deletes)
+        elif duplicates and not args.quiet:
+            print(style.dim(
+                "\nReporting only. Re-run with --delete to remove duplicates "
+                "(guarded)."), file=sys.stderr)
 
     return EXIT_DUPLICATES if duplicates else EXIT_OK
 
