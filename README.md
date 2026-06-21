@@ -10,16 +10,13 @@ Duplicate files pile up over time. You download the same installer twice, copy a
 
 ## Features
 
-- Duplicates are matched by SHA-256 content hash, not by name or size.
-- Files are grouped by size first (no reads needed), and only the size collisions get hashed, so most files in a typical tree are never read.
-- Read-only by default. A normal run only reports. Deleting is a separate step that you opt into, and it always keeps the oldest file in each group.
-- Before any file is unlinked it is reopened without following symlinks, checked against the device and inode recorded during the scan, re-hashed, and then removed relative to its parent directory, so a file edited or swapped between the scan and the delete is skipped instead of removed.
-- Skips symlinks, FIFOs, sockets, and device files, and collapses hardlinks that point at the same inode so they aren't reported as reclaimable space.
-- Won't delete inside the operating system. Files under protected system directories (Windows, `/usr`, `/etc`, and the like) are never offered for deletion, system/root scans and elevated runs are refused outright with no override, and a scan reaching outside your home directory requires typing `DELETE` in full.
-- Escapes non-printable characters (newlines, ANSI escapes) on everything it prints, including OS error messages that embed a filename, so a crafted name can't rewrite your terminal or fake the deletion plan.
-- `--json` writes machine-readable output to stdout while progress stays on stderr, for piping into other tools.
-- Returns `0` (no duplicates), `2` (duplicates found), or `1` (error) so scripts and CI can branch on the result.
-- Runs on Windows, macOS, and Linux. Color output turns itself off when piped, when `NO_COLOR` is set, or with `--color never`.
+- **Content-based.** Matches by SHA-256 hash, not by name or size.
+- **Fast.** Groups by size first and only hashes the size collisions, so most files in a typical tree are never read.
+- **Read-only by default.** A normal run only reports; deletion is opt-in via `--delete` and always keeps the oldest copy in each group.
+- **Safe to delete.** Re-checks each file's inode and hash right before unlinking, and never touches system files, files you don't own, or anything outside the scan (see [Safety](#safety-in-system-locations)).
+- **Robust.** Skips symlinks, FIFOs, sockets, and devices; collapses hardlinks so they aren't counted as wasted space; escapes control and ANSI characters in every path and error it prints.
+- **Scriptable.** `--json` on stdout with progress on stderr; exit codes `0`/`2`/`1` for no-duplicates/duplicates/error.
+- **Cross-platform.** Windows, macOS, and Linux; color auto-disables when piped, when `NO_COLOR` is set, or with `--color never`.
 
 ## Requirements
 
@@ -97,22 +94,24 @@ Text report:
 ```
 Scanned: /home/you/Downloads
 
-Group 1: 3 copies  12.4 MB each  24.8 MB wasted
-  hash: 9f86d081884c7d65...
-  /home/you/Downloads/installer.dmg
-  /home/you/Downloads/old/installer.dmg
-  /home/you/Downloads/backup/installer (1).dmg
+-- Group 1 ---------------------------------------------------
+  3 copies | 12.4 MB each | 24.8 MB wasted
+  sha256: 9f86d081884c7d65...
+    /home/you/Downloads/installer.dmg
+    /home/you/Downloads/old/installer.dmg
+    /home/you/Downloads/backup/installer (1).dmg
 
-Group 2: 2 copies  1.2 MB each  1.2 MB wasted
-  hash: e3b0c44298fc1c14...
-  /home/you/Downloads/report.pdf
-  /home/you/Downloads/report-copy.pdf
+-- Group 2 ---------------------------------------------------
+  2 copies | 1.2 MB each | 1.2 MB wasted
+  sha256: e3b0c44298fc1c14...
+    /home/you/Downloads/report.pdf
+    /home/you/Downloads/report-copy.pdf
 
-------------------------------------------------------------
-2 group(s)  |  26.0 MB wasted in total
-
-Delete redundant copies, keeping the oldest in each group? [y/N]:
+--------------------------------------------------------------
+2 group(s) | 26.0 MB wasted in total
 ```
+
+With `--delete`, the report is followed by the guarded confirmation prompts.
 
 JSON report (`--json`):
 
@@ -151,7 +150,7 @@ JSON report (`--json`):
 2. **Group by size.** Files are bucketed by byte size, which is already known from the walk. Any size that appears only once can't have a duplicate and is dropped, which avoids reading most of the files in a typical tree.
 3. **Hash candidates.** Only files that share a size are read and SHA-256 hashed, in 64 KB chunks. Matching hashes are grouped together, with progress on stderr.
 4. **Report.** Groups of more than one file are sorted largest first and printed as text or JSON, with per-group and total wasted bytes.
-5. **Optional cleanup** (text mode, interactive terminal only). The oldest file in each group is kept as the canonical copy. You confirm once to opt in, can exclude specific groups, then review the full deletion plan and confirm again. Right before each file is unlinked it is reopened without following symlinks and checked against the device/inode recorded during the scan and re-hashed; if either no longer matches, it's skipped. The unlink itself is done relative to the parent directory where the platform supports it, so the entry removed is the one that was checked.
+5. **Optional cleanup** (`--delete`, text mode, interactive terminal only). The oldest file in each group is kept. You opt in, can exclude specific groups, then review the full deletion plan and confirm again. The deletion itself is heavily guarded; see [Safety](#safety-in-system-locations).
 
 ## Safety in system locations
 
@@ -162,35 +161,23 @@ and an unsuspecting user could be talked into doing exactly that. The delete ste
 is fenced accordingly, while reporting stays completely read-only:
 
 - **Read-only by default.** Deletion only happens with an explicit `--delete`
-  flag. Without it the tool reports and exits, so a default run, however the
-  command is pointed, can never remove a file. Someone coaxed into running it
-  without that flag is never in danger.
-- **Protected system directories are off-limits.** Any candidate resolving under
-  a known system root (`C:\Windows`, `C:\Program Files`, `%ProgramData%`, `/usr`,
-  `/etc`, `/bin`, `/lib`, `/System`, `/Library`, and similar) is never added to
-  the deletion plan. There is no flag that relaxes this; it is the hard floor.
-- **Only files you own.** A candidate not owned by the invoking user is skipped
-  (POSIX uid check; on Windows the filesystem ACL already enforces this), so the
-  tool won't remove another user's or a service account's files.
-- **Confined to the scan root.** Every candidate is checked to resolve inside the
-  directory that was scanned, both when the plan is built and again immediately
-  before each unlink, so no symlink or path trick can reach outside it.
+  flag. Without it the tool reports and exits, so a default run can never remove a
+  file, and someone coaxed into running it without the flag is never in danger.
+- **System files and locations are off-limits.** Files under known system roots
+  (`C:\Windows`, `C:\Program Files`, `%ProgramData%`, `/usr`, `/etc`, `/bin`,
+  `/lib`, `/System`, `/Library`, and similar) are never deletable; scanning a
+  drive/system root, or running as root/Administrator, is refused outright. There
+  is no override.
+- **Only your files, only inside the scan.** A candidate is skipped unless you own
+  it (POSIX uid check; Windows ACLs already enforce this) and it resolves within
+  the scanned directory, re-checked immediately before each unlink. Paths are
+  resolved with symlinks and junctions followed, so a link or case trick can't
+  smuggle one past these checks.
+- **Extra friction for risky scope.** A scan outside your home directory requires
+  typing `DELETE` in full rather than a single `y`, and an unusually large result
+  set is flagged as a likely system-wide scan before any prompt.
 - **Capped blast radius.** No single run will delete more than `--max-deletes`
   files (default 10,000); a larger plan is refused with advice to narrow the scan.
-- **System and root scans are refused.** If the scan root is a filesystem/drive
-  root or sits inside a protected directory, the delete step refuses outright,
-  with no override.
-- **Elevated runs are refused.** Running as root or Administrator disables
-  deletion entirely, because that is when a mistake does the most damage. Run the
-  tool as a normal user instead.
-- **Out-of-home scans demand a typed confirmation.** When the scan reaches
-  outside your home directory, the final prompt requires typing `DELETE` in full
-  rather than a single `y`, so it can't be muscle-memoried or coached over a call.
-- **Large result sets are flagged.** An unusually high group count prints a
-  warning that the scan looks system-wide before any deletion prompt.
-
-Resolution is done with symlinks and junctions followed and case-insensitivity
-honored, so a link or a case trick can't smuggle a path past these checks.
 
 ## Testing
 
